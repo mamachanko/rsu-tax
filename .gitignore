@@ -4,3 +4,6 @@ dist/
 *.local
 tsconfig.tsbuildinfo
 public/sql-wasm.wasm
+*.pyc
+__pycache__/
+.venv/
