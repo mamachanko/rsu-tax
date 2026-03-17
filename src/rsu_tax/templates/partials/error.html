@@ -1,0 +1,16 @@
+<div style="
+  background: rgba(245,101,101,.08);
+  border: 1px solid rgba(245,101,101,.3);
+  border-radius: var(--radius);
+  padding: 1rem 1.25rem;
+  margin-top: 1rem;
+  font-size: 0.85rem;
+">
+  <div style="color: var(--loss); font-weight: 600; margin-bottom: 0.4rem;">⚠ Error</div>
+  <div>{{ message }}</div>
+  {% if warnings %}
+  <ul style="padding-left: 1.2em; margin-top: 0.5rem; color: var(--text-muted);">
+    {% for w in warnings %}<li>{{ w }}</li>{% endfor %}
+  </ul>
+  {% endif %}
+</div>

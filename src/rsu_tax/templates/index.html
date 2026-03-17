@@ -1,0 +1,164 @@
+{% extends "base.html" %}
+
+{% block head %}
+<style>
+  /* ── Upload zone ───────────────────────────────────────────────────── */
+  .upload-section {
+    max-width: 580px;
+    margin: 4rem auto 0;
+  }
+  .upload-section h1 {
+    font-size: 1.6rem;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    margin-bottom: 0.4rem;
+  }
+  .upload-section p {
+    color: var(--text-muted);
+    margin-bottom: 2rem;
+    font-size: 0.9rem;
+  }
+  .drop-zone {
+    border: 2px dashed var(--border);
+    border-radius: var(--radius);
+    padding: 3rem 2rem;
+    text-align: center;
+    cursor: pointer;
+    transition: border-color .2s, background .2s;
+    position: relative;
+  }
+  .drop-zone:hover,
+  .drop-zone.dragover { border-color: var(--accent); background: rgba(108,140,255,.05); }
+  .drop-zone input[type="file"] {
+    position: absolute; inset: 0; opacity: 0; cursor: pointer;
+  }
+  .drop-zone .icon { font-size: 2rem; margin-bottom: 0.75rem; color: var(--text-muted); }
+  .drop-zone .primary-text {
+    font-weight: 600;
+    margin-bottom: 0.3rem;
+  }
+  .drop-zone .secondary-text {
+    font-size: 0.8rem;
+    color: var(--text-muted);
+  }
+  .file-name {
+    margin-top: 0.75rem;
+    font-size: 0.82rem;
+    color: var(--accent);
+    font-family: var(--mono);
+  }
+  .upload-actions {
+    margin-top: 1.25rem;
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+  }
+  .upload-actions .btn { flex: 1; justify-content: center; padding: 0.6em 1em; font-size: 0.9rem; }
+
+  /* ── Features list ─────────────────────────────────────────────────── */
+  .features {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 0.75rem;
+    margin-top: 2rem;
+  }
+  .feature {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 0.9rem 1rem;
+    font-size: 0.8rem;
+  }
+  .feature .label { color: var(--text-muted); font-size: 0.7rem; text-transform: uppercase; letter-spacing: .05em; margin-bottom: .3rem; }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="upload-section">
+  <h1>RSU Tax Calculator</h1>
+  <p>Import your Schwab Realized Gain/Loss CSV and get EUR capital gains for your German tax return in seconds.</p>
+
+  <form
+    id="upload-form"
+    hx-post="/upload"
+    hx-target="#results"
+    hx-swap="innerHTML"
+    hx-encoding="multipart/form-data"
+    hx-indicator="#upload-spinner"
+  >
+    <div class="drop-zone" id="drop-zone">
+      <input
+        type="file"
+        name="file"
+        id="file-input"
+        accept=".csv,text/csv"
+        required
+      />
+      <div class="icon">📄</div>
+      <div class="primary-text">Drop your CSV file here</div>
+      <div class="secondary-text">or click to browse · Schwab Realized Gain/Loss format</div>
+      <div class="file-name" id="file-name" style="display:none"></div>
+    </div>
+
+    <div class="upload-actions">
+      <button type="submit" class="btn btn-primary" id="upload-btn" disabled>
+        <span id="upload-spinner" class="htmx-indicator spinner"></span>
+        Calculate
+      </button>
+    </div>
+  </form>
+
+  <div class="features">
+    <div class="feature">
+      <div class="label">Exchange Rates</div>
+      ECB reference rates via Frankfurter API
+    </div>
+    <div class="feature">
+      <div class="label">EUR Conversion</div>
+      Proceeds &amp; cost basis each at their own date rate
+    </div>
+    <div class="feature">
+      <div class="label">Sell-to-Cover</div>
+      Automatically distinguished from voluntary sales
+    </div>
+    <div class="feature">
+      <div class="label">Verification</div>
+      7 data quality checks on every import
+    </div>
+    <div class="feature">
+      <div class="label">Privacy</div>
+      All processing happens locally — nothing leaves your machine
+    </div>
+  </div>
+</div>
+
+<div id="results" class="mt-4"></div>
+
+<script>
+  const input  = document.getElementById("file-input");
+  const zone   = document.getElementById("drop-zone");
+  const label  = document.getElementById("file-name");
+  const btn    = document.getElementById("upload-btn");
+
+  function setFile(name) {
+    label.textContent = name;
+    label.style.display = "";
+    btn.disabled = false;
+  }
+
+  input.addEventListener("change", () => {
+    if (input.files[0]) setFile(input.files[0].name);
+  });
+
+  ["dragenter","dragover"].forEach(e => zone.addEventListener(e, ev => {
+    ev.preventDefault(); zone.classList.add("dragover");
+  }));
+  ["dragleave","drop"].forEach(e => zone.addEventListener(e, ev => {
+    ev.preventDefault(); zone.classList.remove("dragover");
+  }));
+  zone.addEventListener("drop", ev => {
+    const f = ev.dataTransfer?.files[0];
+    if (f) { input.files = ev.dataTransfer.files; setFile(f.name); }
+  });
+</script>
+{% endblock %}

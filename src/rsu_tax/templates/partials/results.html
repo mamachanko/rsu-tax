@@ -1,0 +1,283 @@
+<style>
+  /* ── Results layout ──────────────────────────────────────────────── */
+  .results-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 1rem;
+    margin-bottom: 1.5rem;
+  }
+  .results-title { font-size: 1.2rem; font-weight: 700; letter-spacing: -0.01em; }
+
+  /* ── Year selector ───────────────────────────────────────────────── */
+  .year-form { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
+  .year-btn {
+    padding: 0.3em 0.9em;
+    border-radius: 20px;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--text-muted);
+    font: inherit;
+    font-size: 0.82rem;
+    cursor: pointer;
+    transition: background .15s, color .15s, border-color .15s;
+  }
+  .year-btn:hover { background: var(--surface-2); color: var(--text); }
+  .year-btn.active { background: var(--accent-dim); color: #fff; border-color: var(--accent-dim); }
+
+  /* ── Summary grid ────────────────────────────────────────────────── */
+  .summary-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 1rem;
+    margin-bottom: 1.5rem;
+  }
+  .metric-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 1.1rem 1.25rem;
+  }
+  .metric-label {
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-muted);
+    font-weight: 600;
+    margin-bottom: 0.35rem;
+  }
+  .metric-value {
+    font-size: 1.35rem;
+    font-weight: 700;
+    font-family: var(--mono);
+    letter-spacing: -0.01em;
+    line-height: 1.2;
+  }
+  .metric-sub {
+    font-size: 0.72rem;
+    color: var(--text-muted);
+    margin-top: 0.2rem;
+    font-family: var(--mono);
+  }
+
+  /* ── Section headings ────────────────────────────────────────────── */
+  .section-head {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    margin-bottom: 0.75rem;
+  }
+  .section-head h2 { font-size: 0.9rem; font-weight: 600; }
+
+  /* ── Verification grid ───────────────────────────────────────────── */
+  .checks-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 0.6rem;
+    margin-bottom: 1.5rem;
+  }
+  .check-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.6rem;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 0.65rem 0.85rem;
+    font-size: 0.8rem;
+  }
+  .check-name { font-weight: 600; margin-bottom: 0.15rem; }
+  .check-msg  { color: var(--text-muted); font-size: 0.76rem; line-height: 1.4; }
+
+  /* ── Warnings ────────────────────────────────────────────────────── */
+  .warnings {
+    background: rgba(246,173,85,.08);
+    border: 1px solid rgba(246,173,85,.3);
+    border-radius: var(--radius);
+    padding: 0.85rem 1rem;
+    margin-bottom: 1.25rem;
+    font-size: 0.82rem;
+  }
+  .warnings ul { padding-left: 1.2em; margin-top: 0.4rem; }
+  .warnings li { color: var(--warn); margin-bottom: 0.25rem; }
+  .warnings strong { color: var(--warn); }
+
+  /* ── Action bar ──────────────────────────────────────────────────── */
+  .action-bar {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    margin-bottom: 1rem;
+    flex-wrap: wrap;
+  }
+
+  /* ── Transaction table ───────────────────────────────────────────── */
+  .type-pill {
+    display: inline-block;
+    padding: 0.1em 0.5em;
+    border-radius: 20px;
+    font-size: 0.68rem;
+    font-weight: 600;
+    letter-spacing: 0.03em;
+  }
+  .type-vol { background: rgba(108,140,255,.15); color: var(--accent); }
+  .type-s2c { background: rgba(123,127,158,.12); color: var(--text-muted); }
+</style>
+
+{# ── Year filter ────────────────────────────────────────────────────── #}
+<div class="results-header">
+  <div class="results-title">Results · {{ selected_year }}</div>
+  <form
+    id="year-form"
+    class="year-form"
+    hx-post="/filter"
+    hx-target="#results"
+    hx-swap="innerHTML"
+  >
+    {% for y in years %}
+    <button
+      type="submit"
+      name="year"
+      value="{{ y }}"
+      class="year-btn {% if y == selected_year %}active{% endif %}"
+    >{{ y }}</button>
+    {% endfor %}
+    {% if years | length > 1 %}
+    <button type="submit" name="year" value="" class="year-btn {% if selected_year not in years %}active{% endif %}">All</button>
+    {% endif %}
+  </form>
+</div>
+
+{# ── Warnings ───────────────────────────────────────────────────────── #}
+{% if warnings %}
+<div class="warnings">
+  <strong>⚠ Import warnings</strong>
+  <ul>
+    {% for w in warnings %}<li>{{ w }}</li>{% endfor %}
+  </ul>
+</div>
+{% endif %}
+
+{# ── Summary cards ──────────────────────────────────────────────────── #}
+<div class="summary-grid">
+  <div class="metric-card">
+    <div class="metric-label">Net Gain / Loss</div>
+    <div class="metric-value {{ summary.net_gain_loss_eur | gain_class }}">
+      {{ summary.net_gain_loss_eur | fmt_eur }}
+    </div>
+    <div class="metric-sub">{{ summary.net_gain_loss_usd | fmt_usd }}</div>
+  </div>
+  <div class="metric-card">
+    <div class="metric-label">Voluntary Sales</div>
+    <div class="metric-value {{ summary.voluntary_gain_loss_eur | gain_class }}">
+      {{ summary.voluntary_gain_loss_eur | fmt_eur }}
+    </div>
+    <div class="metric-sub">{{ summary.voluntary_sales }} transaction(s)</div>
+  </div>
+  <div class="metric-card">
+    <div class="metric-label">Sell-to-Cover</div>
+    <div class="metric-value neutral">{{ summary.sell_to_cover_gain_loss_eur | fmt_eur }}</div>
+    <div class="metric-sub">{{ summary.sell_to_cover_sales }} transaction(s)</div>
+  </div>
+  <div class="metric-card">
+    <div class="metric-label">Total Proceeds</div>
+    <div class="metric-value">{{ summary.total_proceeds_eur | fmt_eur }}</div>
+    <div class="metric-sub">{{ summary.total_proceeds_usd | fmt_usd }}</div>
+  </div>
+  <div class="metric-card">
+    <div class="metric-label">Total Cost Basis</div>
+    <div class="metric-value">{{ summary.total_cost_basis_eur | fmt_eur }}</div>
+    <div class="metric-sub">{{ summary.total_cost_basis_usd | fmt_usd }}</div>
+  </div>
+  <div class="metric-card">
+    <div class="metric-label">Transactions</div>
+    <div class="metric-value">{{ summary.total_transactions }}</div>
+    <div class="metric-sub">Tax year {{ summary.tax_year }}</div>
+  </div>
+</div>
+
+{# ── Verification checks ─────────────────────────────────────────────── #}
+<div class="section-head">
+  <h2>Verification</h2>
+  {% set fail_count = checks | selectattr('status', 'eq', 'fail') | list | length %}
+  {% set warn_count = checks | selectattr('status', 'eq', 'warn') | list | length %}
+  {% if fail_count %}<span class="badge badge-fail">{{ fail_count }} failed</span>{% endif %}
+  {% if warn_count %}<span class="badge badge-warn">{{ warn_count }} warning(s)</span>{% endif %}
+  {% if not fail_count and not warn_count %}<span class="badge badge-pass">All passed</span>{% endif %}
+</div>
+<div class="checks-grid mb-2">
+  {% for chk in checks %}
+  <div class="check-row">
+    <span class="badge badge-{{ chk.status }}" style="flex-shrink:0;margin-top:.1rem">{{ chk.status }}</span>
+    <div>
+      <div class="check-name">{{ chk.name }}</div>
+      <div class="check-msg">{{ chk.message }}</div>
+    </div>
+  </div>
+  {% endfor %}
+</div>
+
+{# ── Export buttons ──────────────────────────────────────────────────── #}
+<div class="action-bar">
+  <a href="/download/csv" class="btn btn-outline btn-sm">↓ Download CSV</a>
+  <a href="/download/pdf" class="btn btn-outline btn-sm">↓ Download PDF</a>
+</div>
+
+{# ── Transaction table ───────────────────────────────────────────────── #}
+<div class="section-head">
+  <h2>Transactions <span style="color:var(--text-muted);font-weight:400">({{ computed | length }})</span></h2>
+</div>
+<div class="table-wrap card" style="padding:0">
+  <table>
+    <thead>
+      <tr>
+        <th>Symbol</th>
+        <th>Date Sold</th>
+        <th>Date Acquired</th>
+        <th>Term</th>
+        <th>Type</th>
+        <th class="num">Proceeds $</th>
+        <th class="num">Cost $</th>
+        <th class="num">G/L $</th>
+        <th class="num">Rate (Sale)</th>
+        <th class="num">Proceeds €</th>
+        <th class="num">Cost €</th>
+        <th class="num">G/L €</th>
+        <th>Status</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for t in computed %}
+      <tr class="{% if t.is_sell_to_cover %}stc{% endif %}">
+        <td class="text" style="font-weight:600">{{ t.symbol }}</td>
+        <td>{{ t.date_sold }}</td>
+        <td>{% if t.has_acquisition_date %}{{ t.date_acquired }}{% else %}<span style="color:var(--text-muted)">—</span>{% endif %}</td>
+        <td class="text">{{ t.term[:5] if t.term != "Unknown" else "—" }}</td>
+        <td class="text">
+          {% if t.is_sell_to_cover %}
+          <span class="type-pill type-s2c">S2C</span>
+          {% else %}
+          <span class="type-pill type-vol">Vol</span>
+          {% endif %}
+        </td>
+        <td class="num">{{ t.proceeds_usd | fmt_usd }}</td>
+        <td class="num">{{ t.cost_basis_usd | fmt_usd }}</td>
+        <td class="num {{ t.gain_loss_usd | gain_class }}">{{ t.gain_loss_usd | fmt_usd }}</td>
+        <td class="num" style="color:var(--text-muted)">{{ "%.4f"|format(t.exchange_rate_sold) }}</td>
+        <td class="num">{{ t.proceeds_eur | fmt_eur }}</td>
+        <td class="num">{{ t.cost_basis_eur | fmt_eur }}</td>
+        <td class="num {{ t.gain_loss_eur | gain_class }}">{{ t.gain_loss_eur | fmt_eur }}</td>
+        <td><span class="badge badge-{{ t.verification_status }}">{{ t.verification_status }}</span></td>
+      </tr>
+      {% if t.verification_notes %}
+      <tr>
+        <td colspan="13" style="padding: .25rem .75rem; color: var(--warn); font-size: 0.72rem; font-family: var(--font);">
+          ⚠ {{ t.verification_notes | join(" · ") }}
+        </td>
+      </tr>
+      {% endif %}
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
