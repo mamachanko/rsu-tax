@@ -4,8 +4,8 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
-    "build": "tsc -b && vite build",
+    "dev": "cp node_modules/sql.js/dist/sql-wasm.wasm public/ && vite",
+    "build": "cp node_modules/sql.js/dist/sql-wasm.wasm public/ && tsc -b && vite build",
     "preview": "vite preview",
     "test": "vitest run",
     "test:watch": "vitest"
