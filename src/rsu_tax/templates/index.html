@@ -95,7 +95,7 @@
 {% endblock %}
 
 {% block content %}
-<div class="upload-section">
+<div class="upload-section" id="upload-section">
   <h1>RSU Tax Calculator</h1>
   <p>Import your Schwab Realized Gain/Loss CSV and get EUR capital gains for your German tax return in seconds.</p>
 
@@ -197,5 +197,19 @@
     const f = ev.dataTransfer?.files[0];
     if (f) { input.files = ev.dataTransfer.files; showChip(f.name); }
   });
+
+  // Hide upload section when results arrive; restore drop zone for re-use
+  document.body.addEventListener("htmx:afterSettle", ev => {
+    if (ev.detail.target.id === "results" && ev.detail.target.innerHTML.trim()) {
+      document.getElementById("upload-section").style.display = "none";
+      showZone();
+    }
+  });
+
+  // Called by the toggle button rendered inside the results partial
+  window.toggleUploadSection = function() {
+    const sec = document.getElementById("upload-section");
+    sec.style.display = sec.style.display === "none" ? "" : "none";
+  };
 </script>
 {% endblock %}
