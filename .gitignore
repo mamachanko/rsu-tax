@@ -1,9 +1,6 @@
-node_modules/
-dist/
 .env
-*.local
-tsconfig.tsbuildinfo
-public/sql-wasm.wasm
 *.pyc
 __pycache__/
 .venv/
+dist/
+*.egg-info/
