@@ -29,6 +29,9 @@ class SchwabTransaction(BaseModel):
 class ComputedTransaction(SchwabTransaction):
     exchange_rate_sold: float
     exchange_rate_acquired: float
+    # Actual ECB publication date for each rate (may differ from transaction date on weekends/holidays)
+    effective_date_sold: str
+    effective_date_acquired: str
     proceeds_eur: float
     cost_basis_eur: float
     gain_loss_eur: float
