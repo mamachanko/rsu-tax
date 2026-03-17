@@ -41,12 +41,33 @@
     font-size: 0.8rem;
     color: var(--text-muted);
   }
-  .file-name {
-    margin-top: 0.75rem;
+  /* ── File chip (replaces drop zone after selection) ────────────── */
+  .file-chip {
+    display: none;
+    align-items: center;
+    gap: 0.6rem;
+    padding: 0.7rem 1rem;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+  }
+  .file-chip .chip-icon { font-size: 1.2rem; flex-shrink: 0; }
+  .file-chip .chip-name {
+    flex: 1;
+    font-family: var(--mono);
     font-size: 0.82rem;
     color: var(--accent);
-    font-family: var(--mono);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
+  .file-chip .chip-change {
+    font-size: 0.78rem;
+    color: var(--text-muted);
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+  .file-chip .chip-change:hover { color: var(--text); text-decoration: underline; }
   .upload-actions {
     margin-top: 1.25rem;
     display: flex;
@@ -97,7 +118,11 @@
       <div class="icon">📄</div>
       <div class="primary-text">Drop your CSV file here</div>
       <div class="secondary-text">or click to browse · Schwab Realized Gain/Loss format</div>
-      <div class="file-name" id="file-name" style="display:none"></div>
+    </div>
+    <div class="file-chip" id="file-chip">
+      <span class="chip-icon">📄</span>
+      <span class="chip-name" id="chip-name"></span>
+      <a class="chip-change" id="chip-change">change</a>
     </div>
 
     <div class="upload-actions">
@@ -135,19 +160,31 @@
 <div id="results" class="mt-4"></div>
 
 <script>
-  const input  = document.getElementById("file-input");
-  const zone   = document.getElementById("drop-zone");
-  const label  = document.getElementById("file-name");
-  const btn    = document.getElementById("upload-btn");
+  const input    = document.getElementById("file-input");
+  const zone     = document.getElementById("drop-zone");
+  const chip     = document.getElementById("file-chip");
+  const chipName = document.getElementById("chip-name");
+  const chipChg  = document.getElementById("chip-change");
+  const btn      = document.getElementById("upload-btn");
 
-  function setFile(name) {
-    label.textContent = name;
-    label.style.display = "";
+  function showChip(name) {
+    zone.style.display = "none";
+    chipName.textContent = name;
+    chip.style.display = "flex";
     btn.disabled = false;
   }
 
+  function showZone() {
+    chip.style.display = "none";
+    zone.style.display = "";
+    input.value = "";
+    btn.disabled = true;
+  }
+
+  chipChg.addEventListener("click", showZone);
+
   input.addEventListener("change", () => {
-    if (input.files[0]) setFile(input.files[0].name);
+    if (input.files[0]) showChip(input.files[0].name);
   });
 
   ["dragenter","dragover"].forEach(e => zone.addEventListener(e, ev => {
@@ -158,7 +195,7 @@
   }));
   zone.addEventListener("drop", ev => {
     const f = ev.dataTransfer?.files[0];
-    if (f) { input.files = ev.dataTransfer.files; setFile(f.name); }
+    if (f) { input.files = ev.dataTransfer.files; showChip(f.name); }
   });
 </script>
 {% endblock %}
