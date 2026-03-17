@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .exchange_rates import find_rate
+from .exchange_rates import find_rate_with_date
 from .models import ComputedTransaction, SchwabTransaction, TaxSummary
 
 _SELL_TO_COVER_TOLERANCE_USD = 1.0
@@ -38,15 +38,15 @@ def compute_capital_gains(
     computed: list[ComputedTransaction] = []
 
     for t in transactions:
-        rate_sold = find_rate(t.date_sold, rates)
-        rate_acquired = find_rate(t.date_acquired, rates)
+        result_sold = find_rate_with_date(t.date_sold, rates)
+        result_acquired = find_rate_with_date(t.date_acquired, rates)
         notes: list[str] = []
         status = "pass"
 
-        if rate_sold is None:
+        if result_sold is None:
             notes.append(f"No exchange rate found for sale date {t.date_sold}")
             status = "fail"
-        if rate_acquired is None:
+        if result_acquired is None:
             notes.append(f"No exchange rate found for acquisition date {t.date_acquired}")
             status = "fail"
 
@@ -58,8 +58,8 @@ def compute_capital_gains(
             if status == "pass":
                 status = "warn"
 
-        r_sold = rate_sold or 0.0
-        r_acq = rate_acquired or 0.0
+        r_sold, eff_sold = result_sold if result_sold else (0.0, t.date_sold)
+        r_acq, eff_acq = result_acquired if result_acquired else (0.0, t.date_acquired)
 
         proceeds_eur = _round_cents(t.proceeds_usd * r_sold)
         cost_basis_eur = _round_cents(t.cost_basis_usd * r_acq)
@@ -80,6 +80,8 @@ def compute_capital_gains(
                 **t.model_dump(),
                 exchange_rate_sold=r_sold,
                 exchange_rate_acquired=r_acq,
+                effective_date_sold=eff_sold,
+                effective_date_acquired=eff_acq,
                 proceeds_eur=proceeds_eur,
                 cost_basis_eur=cost_basis_eur,
                 gain_loss_eur=gain_loss_eur,

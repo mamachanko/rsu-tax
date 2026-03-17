@@ -14,7 +14,7 @@ from fastapi.templating import Jinja2Templates
 from .calculator import compute_capital_gains, compute_summary
 from .csv_parser import parse_schwab_csv
 from .exchange_rates import rates_for_dates
-from .export import export_csv, export_pdf
+from .export import export_csv, export_markdown, export_pdf
 from .models import ComputedTransaction, TaxSummary, VerificationCheck
 from .verification import run_verification
 
@@ -201,6 +201,26 @@ async def download_csv(request: Request) -> Response:
         content=csv_content,
         media_type="text/csv",
         headers={"Content-Disposition": f'attachment; filename="rsu-gains-{year}.csv"'},
+    )
+
+
+@app.get("/download/markdown")
+async def download_markdown(request: Request) -> Response:
+    token = request.cookies.get("session", "")
+    session = _sessions.get(token, {})
+    computed: list[ComputedTransaction] = session.get("computed", [])
+    summary: TaxSummary | None = session.get("summary")
+    checks: list[VerificationCheck] = session.get("checks", [])
+
+    if not computed or summary is None:
+        raise HTTPException(status_code=404, detail="No data. Please upload a file first.")
+
+    md_content = export_markdown(computed, summary, checks)
+    year = computed[0].date_sold[:4] if computed else "unknown"
+    return Response(
+        content=md_content,
+        media_type="text/markdown; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="rsu-gains-{year}.md"'},
     )
 
 

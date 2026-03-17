@@ -56,13 +56,25 @@ def find_rate(date_str: str, rates: dict[str, float]) -> float | None:
     Look up the exchange rate for a date.
     Falls back up to 7 days earlier (to handle weekends / public holidays).
     """
+    result = find_rate_with_date(date_str, rates)
+    return result[0] if result else None
+
+
+def find_rate_with_date(
+    date_str: str, rates: dict[str, float]
+) -> tuple[float, str] | None:
+    """
+    Look up the exchange rate for a date, also returning the actual ECB publication date.
+    Falls back up to 7 days earlier (to handle weekends / public holidays).
+    Returns (rate, effective_date) or None.
+    """
     if date_str in rates:
-        return rates[date_str]
+        return rates[date_str], date_str
 
     d = _parse_date(date_str)
     for i in range(1, 8):
         prev = _shift_date(d, -i).isoformat()
         if prev in rates:
-            return rates[prev]
+            return rates[prev], prev
 
     return None
