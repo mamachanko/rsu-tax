@@ -76,6 +76,104 @@
   }
   .upload-actions .btn { flex: 1; justify-content: center; padding: 0.6em 1em; font-size: 0.9rem; }
 
+  /* ── Info overlay ──────────────────────────────────────────────────── */
+  .info-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 1000;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    padding: 2rem;
+  }
+  .info-overlay.open { display: flex; }
+  .info-backdrop {
+    position: absolute;
+    inset: 0;
+    background: rgba(0,0,0,.6);
+    backdrop-filter: blur(4px);
+  }
+  .info-panel {
+    position: relative;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 2rem;
+    max-width: 640px;
+    width: 100%;
+    max-height: 80vh;
+    overflow-y: auto;
+    box-shadow: 0 8px 32px rgba(0,0,0,.4);
+  }
+  .info-panel h2 {
+    font-size: 1.1rem;
+    font-weight: 700;
+    margin-bottom: 1.25rem;
+    letter-spacing: -0.01em;
+  }
+  .info-panel .close-btn {
+    position: absolute;
+    top: 1rem;
+    right: 1rem;
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    font-size: 1.2rem;
+    cursor: pointer;
+    padding: 0.25rem;
+    line-height: 1;
+  }
+  .info-panel .close-btn:hover { color: var(--text); }
+  .info-step {
+    margin-bottom: 1.25rem;
+    padding-left: 1.5rem;
+    position: relative;
+  }
+  .info-step::before {
+    content: attr(data-step);
+    position: absolute;
+    left: 0;
+    top: 0;
+    font-size: 0.75rem;
+    font-weight: 700;
+    color: var(--accent);
+    font-family: var(--mono);
+  }
+  .info-step h3 {
+    font-size: 0.88rem;
+    font-weight: 600;
+    margin-bottom: 0.35rem;
+  }
+  .info-step p,
+  .info-step ul {
+    font-size: 0.82rem;
+    color: var(--text-muted);
+    line-height: 1.55;
+  }
+  .info-step ul {
+    padding-left: 1.2em;
+    margin-top: 0.3rem;
+  }
+  .info-step ul li { margin-bottom: 0.2rem; }
+  .info-step code {
+    font-family: var(--mono);
+    font-size: 0.78rem;
+    background: var(--surface-2);
+    padding: 0.1em 0.35em;
+    border-radius: 3px;
+    color: var(--accent);
+  }
+  .info-link {
+    font-size: 0.82rem;
+    cursor: pointer;
+    color: var(--accent);
+    background: none;
+    border: none;
+    font: inherit;
+    padding: 0;
+  }
+  .info-link:hover { text-decoration: underline; }
+
   /* ── Features list ─────────────────────────────────────────────────── */
   .features {
     display: grid;
@@ -97,7 +195,9 @@
 {% block content %}
 <div class="upload-section" id="upload-section">
   <h1>RSU Tax Calculator</h1>
-  <p>Import your Schwab Realized Gain/Loss CSV and get EUR capital gains for your German tax return in seconds.</p>
+  <p>Import your Schwab Realized Gain/Loss CSV and get EUR capital gains for your German tax return in seconds.
+    <button type="button" class="info-link" onclick="document.getElementById('info-overlay').classList.add('open')">How do I get this data?</button>
+  </p>
 
   <form
     id="upload-form"
@@ -157,6 +257,56 @@
   </div>
 </div>
 
+{# ── Acquisition info overlay ─────────────────────────────────────── #}
+<div class="info-overlay" id="info-overlay">
+  <div class="info-backdrop" onclick="document.getElementById('info-overlay').classList.remove('open')"></div>
+  <div class="info-panel">
+    <button type="button" class="close-btn" onclick="document.getElementById('info-overlay').classList.remove('open')">&times;</button>
+    <h2>How to Get Your Data from Schwab</h2>
+
+    <div class="info-step" data-step="1">
+      <h3>Find your vesting date &amp; FMV per share</h3>
+      <ul>
+        <li>Log in to <a href="https://eac.schwab.com" target="_blank" rel="noopener">Equity Award Center</a></li>
+        <li>Navigate to <code>History</code> &rarr; <code>Transactions</code> &rarr; filter by <code>Vest</code></li>
+        <li>Each vesting event shows: vest date, shares delivered, and FMV per share on the vest date (USD)</li>
+        <li>This FMV is your <strong style="color:var(--text)">USD cost basis per share</strong></li>
+      </ul>
+    </div>
+
+    <div class="info-step" data-step="2">
+      <h3>Find your sale date &amp; sale price</h3>
+      <ul>
+        <li>In the same Equity Award Center &rarr; <code>History</code> &rarr; filter by <code>Sale</code></li>
+        <li>Each sale shows: sale date, shares sold, and gross proceeds per share (USD)</li>
+      </ul>
+    </div>
+
+    <div class="info-step" data-step="3">
+      <h3>Download the 1099-B form</h3>
+      <ul>
+        <li>In Schwab: <code>Statements</code> &rarr; <code>Account</code> dropdown &rarr; select <code>Equity Award Center</code> &rarr; enable <code>Tax Forms</code> filter &rarr; download your <strong style="color:var(--text)">1099-B</strong></li>
+        <li>This gives lot-level data: acquisition date, cost basis (USD), proceeds (USD), and gain/loss (USD)</li>
+        <li>Export the <strong style="color:var(--text)">Realized Gain/Loss CSV</strong> for upload here</li>
+      </ul>
+    </div>
+
+    <div class="info-step" data-step="4">
+      <h3>ECB EUR/USD exchange rates</h3>
+      <p>This tool fetches ECB reference rates automatically. If you want to verify them manually:</p>
+      <ul>
+        <li><a href="https://www.bundesbank.de/en/statistics/exchange-rates" target="_blank" rel="noopener">Bundesbank</a> &rarr; Statistics &rarr; Exchange Rates &rarr; Euro foreign exchange reference rates</li>
+        <li><a href="https://sdw.ecb.europa.eu" target="_blank" rel="noopener">ECB Statistical Data Warehouse</a></li>
+        <li>Look up the USD/EUR rate for each vesting date and each sale date</li>
+      </ul>
+    </div>
+
+    <div style="margin-top:1rem; padding-top:1rem; border-top:1px solid var(--border); font-size:0.8rem; color:var(--text-muted);">
+      <strong style="color:var(--warn)">Note:</strong> You cannot use the USD gain/loss figure from Schwab directly for German taxes. German tax law requires converting proceeds and cost basis to EUR separately at the ECB rate for each respective date.
+    </div>
+  </div>
+</div>
+
 <div id="results" class="mt-4"></div>
 
 <script>
@@ -196,6 +346,11 @@
   zone.addEventListener("drop", ev => {
     const f = ev.dataTransfer?.files[0];
     if (f) { input.files = ev.dataTransfer.files; showChip(f.name); }
+  });
+
+  // Close info overlay on Escape
+  document.addEventListener("keydown", ev => {
+    if (ev.key === "Escape") document.getElementById("info-overlay").classList.remove("open");
   });
 
   // Hide upload section when results arrive; restore drop zone for re-use
