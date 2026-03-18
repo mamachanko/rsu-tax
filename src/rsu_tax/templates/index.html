@@ -164,15 +164,21 @@
     color: var(--accent);
   }
   .info-link {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
     font-size: 0.82rem;
     cursor: pointer;
     color: var(--accent);
-    background: none;
-    border: none;
+    background: rgba(108,140,255,.08);
+    border: 1px solid rgba(108,140,255,.25);
+    border-radius: var(--radius);
     font: inherit;
-    padding: 0;
+    padding: 0.45em 0.9em;
+    margin-top: 0.5rem;
+    transition: background .15s, border-color .15s;
   }
-  .info-link:hover { text-decoration: underline; }
+  .info-link:hover { background: rgba(108,140,255,.15); border-color: rgba(108,140,255,.4); }
 
   /* ── Features list ─────────────────────────────────────────────────── */
   .features {
@@ -195,9 +201,10 @@
 {% block content %}
 <div class="upload-section" id="upload-section">
   <h1>RSU Tax Calculator</h1>
-  <p>Import your Schwab Realized Gain/Loss CSV and get EUR capital gains for your German tax return in seconds.
-    <button type="button" class="info-link" onclick="document.getElementById('info-overlay').classList.add('open')">How do I get this data?</button>
-  </p>
+  <p>Import your Schwab Realized Gain/Loss CSV and get EUR capital gains for your German tax return in seconds.</p>
+  <div style="margin-bottom:1.5rem">
+    <button type="button" class="info-link" onclick="document.getElementById('info-overlay').classList.add('open')">? How do I get this data?</button>
+  </div>
 
   <form
     id="upload-form"
@@ -225,11 +232,9 @@
       <a class="chip-change" id="chip-change">change</a>
     </div>
 
-    <div class="upload-actions">
-      <button type="submit" class="btn btn-primary" id="upload-btn" disabled>
-        <span id="upload-spinner" class="htmx-indicator spinner"></span>
-        Calculate
-      </button>
+    <div class="upload-actions" id="upload-actions" style="display:none">
+      <span id="upload-spinner" class="htmx-indicator spinner"></span>
+      <span style="color:var(--text-muted);font-size:0.82rem">Calculating…</span>
     </div>
   </form>
 
@@ -283,12 +288,16 @@
     </div>
 
     <div class="info-step" data-step="3">
-      <h3>Download the 1099-B form</h3>
+      <h3>Download your tax form &amp; export CSV</h3>
       <ul>
-        <li>In Schwab: <code>Statements</code> &rarr; <code>Account</code> dropdown &rarr; select <code>Equity Award Center</code> &rarr; enable <code>Tax Forms</code> filter &rarr; download your <strong style="color:var(--text)">1099-B</strong></li>
-        <li>This gives lot-level data: acquisition date, cost basis (USD), proceeds (USD), and gain/loss (USD)</li>
-        <li>Export the <strong style="color:var(--text)">Realized Gain/Loss CSV</strong> for upload here</li>
+        <li>In Schwab: <code>Statements</code> &rarr; <code>Account</code> dropdown &rarr; select <code>Equity Award Center</code> &rarr; enable <code>Tax Forms</code> filter</li>
+        <li><strong style="color:var(--text)">US tax residents</strong> receive a <strong style="color:var(--text)">1099-B</strong> — reports lot-level sale proceeds, cost basis, and gain/loss (USD)</li>
+        <li><strong style="color:var(--text)">Non-US persons</strong> (e.g. German tax residents) typically receive a <strong style="color:var(--text)">1042-S</strong> instead — reports US-source income from RSU vesting and any US tax withheld (usually 30%, or a reduced treaty rate)</li>
+        <li>Regardless of which tax form you receive, navigate to <code>Realized Gain/Loss</code> and export the <strong style="color:var(--text)">CSV</strong> for upload here</li>
       </ul>
+      <p style="margin-top:0.4rem;color:var(--warn);font-size:0.78rem">
+        <strong>1042-S vs 1099-B:</strong> The 1042-S covers the withholding on your RSU vesting income, while sale-level data (proceeds, cost basis) comes from the Realized Gain/Loss report. Both US and non-US persons use the same CSV export for this calculator.
+      </p>
     </div>
 
     <div class="info-step" data-step="4">
@@ -315,26 +324,29 @@
   const chip     = document.getElementById("file-chip");
   const chipName = document.getElementById("chip-name");
   const chipChg  = document.getElementById("chip-change");
-  const btn      = document.getElementById("upload-btn");
+  const actions  = document.getElementById("upload-actions");
+  const form     = document.getElementById("upload-form");
 
-  function showChip(name) {
+  function showChipAndSubmit(name) {
     zone.style.display = "none";
     chipName.textContent = name;
     chip.style.display = "flex";
-    btn.disabled = false;
+    actions.style.display = "flex";
+    // Auto-submit via HTMX
+    htmx.trigger(form, "submit");
   }
 
   function showZone() {
     chip.style.display = "none";
+    actions.style.display = "none";
     zone.style.display = "";
     input.value = "";
-    btn.disabled = true;
   }
 
   chipChg.addEventListener("click", showZone);
 
   input.addEventListener("change", () => {
-    if (input.files[0]) showChip(input.files[0].name);
+    if (input.files[0]) showChipAndSubmit(input.files[0].name);
   });
 
   ["dragenter","dragover"].forEach(e => zone.addEventListener(e, ev => {
@@ -345,7 +357,7 @@
   }));
   zone.addEventListener("drop", ev => {
     const f = ev.dataTransfer?.files[0];
-    if (f) { input.files = ev.dataTransfer.files; showChip(f.name); }
+    if (f) { input.files = ev.dataTransfer.files; showChipAndSubmit(f.name); }
   });
 
   // Close info overlay on Escape
