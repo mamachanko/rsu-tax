@@ -16,7 +16,8 @@ When a user follows all the steps in the current info dialog, they end up with:
 | **B** | **Transaction History (Vesting Events)** | EAC → History → Transactions → filter "Vest" → Export | CSV / JSON / screen scrape | Per-vest: vest date, shares vested, shares delivered (after withholding), FMV per share on vest date, share withholding count |
 | **C** | **Transaction History (Sales)** | EAC → History → Transactions → filter "Sale" → Export | CSV / JSON / screen scrape | Per-sale: sale date, shares sold, gross sale price per share, net proceeds |
 | **D** | **1042-S** (non-US residents) | Statements → Tax Forms | PDF | US-source income from RSU vesting, US tax withheld (rate, amount), treaty info |
-| **E** | **1099-B** (US residents) | Statements → Tax Forms | PDF | Lot-level: proceeds, cost basis, gain/loss, wash sale adjustments — similar to Realized Gain/Loss but official IRS form |
+
+> **Note:** The 1099-B is a US-resident-only form. As German tax residents, we will never receive one. It is excluded from this plan entirely.
 
 ### Classification: Required vs Optional
 
@@ -24,9 +25,8 @@ When a user follows all the steps in the current info dialog, they end up with:
 |------|-----------|-----|
 | **A — Realized Gain/Loss CSV** | **Required** | Core data for EUR capital gains calculation. Already supported. |
 | **B — Vesting History** | **Recommended** | Fills in missing acquisition dates and provides authoritative FMV (cost basis) per share. Improves accuracy. |
-| **C — Sale History** | **Optional** | Cross-verification of sale prices and proceeds. Redundant with file A but useful for sanity checks. |
-| **D — 1042-S** | **Optional (beneficial)** | Enables reporting US tax withheld for foreign tax credit claims on the German return. Currently not captured at all. |
-| **E — 1099-B** | **Optional** | Largely redundant with file A. Could serve as a verification source. Low priority. |
+| **C — Sale History** | **Optional (defer)** | Cross-verification of sale prices and proceeds. Redundant with file A. Deferred from v1. |
+| **D — 1042-S** | **Optional (beneficial)** | Enables reporting US tax withheld for foreign tax credit claims on the German return (Anlage AUS). |
 
 ---
 
@@ -94,10 +94,79 @@ Replace the single upload with a **multi-section file import** interface:
 - The Calculate button enables as soon as the required file is provided
 - Optional files just enhance the results — they're never blocking
 
-**Info dialog update:**
-- Rewrite the "How do I get this data?" overlay to match the new multi-file structure
-- Each step maps directly to a file upload section
-- Add specific download instructions for each file type
+**Info dialog redesign — "Your Schwab Files" guide:**
+
+The current info dialog is vague ("look up vesting data"). The new dialog should create a clear mental model: "here's exactly what you'll download, and here's what you'll end up with."
+
+Structure:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Your Schwab Files                                          │
+│                                                             │
+│  You'll download up to 3 files from Schwab. Here's where   │
+│  to find each one and what it contains.                     │
+│                                                             │
+│  ── File 1: Realized Gain/Loss (REQUIRED) ──────────────── │
+│                                                             │
+│  This is your main transaction data — every lot you sold.   │
+│                                                             │
+│  Where to get it:                                           │
+│  1. Log in to schwab.com                                    │
+│  2. Go to Accounts → Equity Award Center                   │
+│  3. Click "Realized Gain/Loss" in the left sidebar          │
+│  4. Set the date range to cover your tax year               │
+│  5. Click "Export" (top right) → CSV                        │
+│                                                             │
+│  What you'll get:                                           │
+│  A CSV file with one row per lot sold — symbol, dates,      │
+│  proceeds, cost basis, and gain/loss in USD.                │
+│                                                             │
+│  ── File 2: Vesting History (RECOMMENDED) ──────────────── │
+│                                                             │
+│  This gives us authoritative vest dates and the fair market │
+│  value per share — improving accuracy of your EUR cost      │
+│  basis calculation.                                         │
+│                                                             │
+│  Where to get it:                                           │
+│  1. In Equity Award Center, click "History"                 │
+│  2. Go to "Transactions" tab                                │
+│  3. Filter by event type: "Vest"                            │
+│  4. Set date range to cover your tax year                   │
+│  5. Click "Export" → CSV                                    │
+│                                                             │
+│  What you'll get:                                           │
+│  A CSV with one row per vesting event — vest date, shares   │
+│  vested, shares delivered, shares withheld, FMV per share.  │
+│                                                             │
+│  ── File 3: 1042-S Tax Form (OPTIONAL) ────────────────── │
+│                                                             │
+│  If you want to claim a foreign tax credit on your German   │
+│  return (Anlage AUS), this form has the US tax withheld.    │
+│                                                             │
+│  Where to get it:                                           │
+│  1. Go to Accounts → Statements                            │
+│  2. Click "Tax Forms" tab                                   │
+│  3. Find your 1042-S for the relevant tax year              │
+│  4. Download PDF                                            │
+│                                                             │
+│  What you'll get:                                           │
+│  A PDF showing gross RSU income, withholding rate, and      │
+│  total US federal tax withheld.                             │
+│                                                             │
+│  ── Summary: Your file checklist ───────────────────────── │
+│                                                             │
+│  After following these steps you should have:               │
+│                                                             │
+│  ✓ realized-gain-loss.csv ............ REQUIRED             │
+│  ✓ vesting-history.csv ............... RECOMMENDED          │
+│  ○ 1042-S.pdf ........................ OPTIONAL             │
+│                                                             │
+│  Upload them above and click Calculate.                     │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Key improvement:** The dialog ends with a concrete "file checklist" so the user knows exactly which files they should have on disk before proceeding.
 
 ---
 
@@ -223,10 +292,48 @@ Add to the existing 7 checks:
 
 ---
 
-## 6. Implementation Order
+## 6. Anonymization / Randomization Tool
+
+A CLI tool (or web UI button) that takes real Schwab files and produces randomized versions safe for use as test data, demo data, or sharing with AI assistants.
+
+### What it anonymizes:
+
+| Field | Strategy |
+|-------|----------|
+| Symbol / Company name | Replace with fake ticker + name (e.g., `XYZC` / `EXAMPLE CORP`) |
+| Account numbers | Strip or replace with `...XXX` |
+| Quantities | Multiply by random factor (0.5–2.0), round to whole shares |
+| Prices / Proceeds / Cost basis | Shift by random ±5–15%, keep internal consistency (proceeds = price × qty) |
+| Dates | Shift all dates by same random offset (±30–90 days) to preserve relative ordering |
+| Gain/Loss | Recompute from randomized proceeds − cost basis |
+| Names / Addresses (in 1042-S) | Replace with placeholder text |
+| Award IDs / Grant IDs | Randomize |
+
+### Key properties preserved:
+- **Internal consistency**: gain/loss = proceeds − cost basis still holds
+- **Relative date ordering**: acquisition before sale, vesting before sale
+- **Realistic ranges**: prices stay in plausible stock price territory
+- **File format**: output is valid CSV/PDF that the app can still parse
+
+### Implementation:
+
+```
+src/rsu_tax/anonymize.py     — core anonymization logic
+src/rsu_tax/cli.py            — CLI entry point: `rsu-tax anonymize <file> [--output <dir>]`
+```
+
+- Works on all supported file types (Realized G/L CSV, Vesting CSV, 1042-S PDF)
+- Applies a random seed (optionally user-provided for reproducibility)
+- Outputs anonymized files to a specified directory (default: `./anonymized/`)
+- Also usable from the web UI: a small "Anonymize my files" utility page
+
+---
+
+## 7. Implementation Order
 
 | Phase | Scope | Effort |
 |-------|-------|--------|
+| **Phase 0** | Anonymization tool (unblocks everything else — produces test data) | Medium |
 | **Phase 1** | Frontend: multi-file upload UX + updated info dialog | Medium |
 | **Phase 2** | Vesting history parser + data enrichment + matching | Medium |
 | **Phase 3** | Backend: merge vesting data into calculation pipeline | Medium |
@@ -235,16 +342,22 @@ Add to the existing 7 checks:
 | **Phase 6** | Export enhancements (CSV, PDF, Markdown) | Small |
 | **Phase 7** | Tests for all new parsers and enrichment logic | Medium |
 
-### Phase 1 — Frontend (start here)
+### Phase 0 — Anonymization Tool (start here)
+- Create `anonymize.py` with randomization logic for CSV files
+- Add CLI entry point (`rsu-tax anonymize`)
+- User runs this on their real files → produces safe test data for `test-data/`
+- This unblocks all other phases by providing realistic sample files
+
+### Phase 1 — Frontend
 - Redesign `index.html` with multi-section upload
-- Update info overlay with per-file instructions
+- Update info overlay with detailed per-file download instructions and file checklist
 - Modify form to send multiple files via HTMX
 - Update `app.py` route to accept optional files (pass-through initially)
 
 ### Phase 2 — Vesting Parser
 - Create `vesting_parser.py` with column auto-detection
 - Add `VestingEvent` model
-- Write tests with sample vesting CSV
+- Write tests with anonymized sample vesting CSV
 
 ### Phase 3 — Data Enrichment
 - Add matching logic in `calculator.py`
@@ -273,12 +386,16 @@ Add to the existing 7 checks:
 
 ## 7. Open Questions / Decisions Needed
 
-1. **Vesting History format**: Schwab's EAC transaction export format needs to be confirmed. The user may need to provide a sample file, or we design the parser flexibly with column auto-detection (like the existing CSV parser).
+1. **Vesting History format**: Schwab's EAC transaction export format needs to be confirmed. The user should run the anonymization tool on a real export so we can see the actual column names. We design the parser flexibly with column auto-detection (like the existing CSV parser).
 
 2. **1042-S parsing reliability**: PDF parsing of tax forms can be fragile. Should we:
    - (a) Attempt automatic PDF parsing with fallback to manual entry, or
    - (b) Just provide 3 manual input fields (gross income, tax withheld, rate)?
 
-3. **Sale History (File C)**: Should we include this in v1 or defer? It's mostly redundant with the Realized Gain/Loss data. Recommendation: defer to keep scope manageable.
+3. **Sale History (File C)**: Deferred from v1 — mostly redundant with Realized Gain/Loss data.
 
-4. **1099-B**: Same question — defer? Recommendation: defer.
+### Decisions already made
+
+- **1099-B**: Excluded entirely. As German tax residents we never receive this US-only form.
+- **Anonymization tool**: Phase 0 — build first to unblock test data for all other phases.
+- **Info dialog**: Full rewrite with per-file download instructions and a file checklist summary.
