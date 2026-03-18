@@ -39,9 +39,12 @@ def _anonymize(args: list[str]) -> None:
 
     parser = argparse.ArgumentParser(
         prog="rsu-tax anonymize",
-        description="Anonymize Schwab CSV exports for safe sharing and testing.",
+        description=(
+            "Anonymize Schwab data exports for safe sharing and testing.\n"
+            "Supports: Realized Gain/Loss CSV, Vesting History CSV, 1042-S PDF."
+        ),
     )
-    parser.add_argument("file", help="Path to the CSV file to anonymize")
+    parser.add_argument("file", help="Path to the file to anonymize (CSV or PDF)")
     parser.add_argument(
         "-o", "--output",
         help="Output file path (default: <input>-anonymized.csv)",
@@ -65,7 +68,14 @@ def _anonymize(args: list[str]) -> None:
         output_path = f"{base}-anonymized{ext}"
 
     config = AnonConfig(seed=opts.seed)
-    anonymize_file(opts.file, output_path, config)
+    file_type = anonymize_file(opts.file, output_path, config)
+    type_label = {
+        "realized_gains": "Realized Gain/Loss CSV",
+        "vesting": "Vesting History CSV",
+        "pdf": "1042-S PDF",
+        "csv_unknown": "CSV (unknown type — treated as Realized Gain/Loss)",
+    }.get(file_type, file_type)
+    print(f"Detected:    {type_label}")
     print(f"Anonymized → {output_path}")
 
 

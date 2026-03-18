@@ -1,9 +1,16 @@
-"""Anonymize / randomize Schwab CSV exports for safe sharing and testing."""
+"""Anonymize / randomize Schwab data exports for safe sharing and testing.
+
+Supports:
+- Realized Gain/Loss CSV
+- Vesting History CSV (any column layout — auto-detected)
+- 1042-S PDF (generates a new clean PDF with randomized values)
+"""
 
 from __future__ import annotations
 
 import csv
 import io
+import os
 import random
 import re
 import string
@@ -482,9 +489,361 @@ def _recompute_totals(csv_text: str, col_map: dict[str, int], headers: list[str]
     return "\n".join(lines) + "\n"
 
 
-def anonymize_file(input_path: str, output_path: str, config: AnonConfig | None = None) -> None:
-    """Read a CSV file, anonymize it, and write the result."""
-    # Try UTF-8-sig first (handles BOM), fall back to latin-1
+# ── Vesting CSV anonymization ──────────────────────────────────────────────
+
+# Column hints for vesting history exports.  We don't know Schwab's exact
+# headers yet, so we cast a wide net and classify columns by content type.
+
+_VESTING_HEADER_HINTS: dict[str, list[str]] = {
+    "date": ["date", "vest date", "vesting date", "award date", "release date"],
+    "event_type": ["action", "type", "event", "transaction type", "event type"],
+    "symbol": ["symbol", "ticker"],
+    "name": ["name", "description", "company", "security name"],
+    "shares_vested": ["shares vested", "vested", "total shares"],
+    "shares_delivered": ["shares delivered", "delivered", "net shares", "shares released"],
+    "shares_withheld": ["shares withheld", "withheld", "shares used for taxes",
+                        "tax withholding shares"],
+    "fmv": ["fair market value", "fmv", "market value", "price", "vest price",
+            "vest fmv", "market price"],
+    "value": ["value", "total value", "market value total", "gross value", "amount"],
+    "award_id": ["award id", "grant id", "award", "grant", "award number",
+                 "grant number", "award name"],
+    "tax_withheld": ["tax withheld", "taxes", "taxes withheld", "federal tax",
+                     "tax amount"],
+}
+
+
+def _detect_vesting_columns(headers: list[str]) -> dict[str, int]:
+    """Map vesting field types to column indices."""
+    normalized = [re.sub(r"[^a-z0-9/ ()$%-]", "", h.lower()).strip() for h in headers]
+    mapping: dict[str, int] = {}
+    used: set[int] = set()
+
+    for field_name, hints in _VESTING_HEADER_HINTS.items():
+        for hint in hints:
+            idx = next(
+                (i for i, h in enumerate(normalized) if i not in used and hint in h),
+                -1,
+            )
+            if idx != -1:
+                mapping[field_name] = idx
+                used.add(idx)
+                break
+
+    return mapping
+
+
+def anonymize_vesting_csv(csv_text: str, config: AnonConfig | None = None) -> str:
+    """Anonymize a Schwab vesting history CSV export.
+
+    Works with any column layout — auto-detects columns by header name hints.
+    Columns that aren't recognized are left as-is (safe default for non-PII
+    fields like "Status" or "Plan Type").
+    """
+    config = config or AnonConfig()
+    rng = _make_rng(config.seed)
+
+    lines = csv_text.splitlines()
+
+    # Find header row: look for a row containing "date" and either "shares"
+    # or "vest" or "fmv" or "symbol"
+    header_idx = 0
+    for i, line in enumerate(lines[:10]):
+        lower = line.lower()
+        if "date" in lower and any(k in lower for k in ("share", "vest", "fmv",
+                                                         "symbol", "action", "event")):
+            header_idx = i
+            break
+
+    csv_block = "\n".join(lines[header_idx:])
+    reader = csv.reader(io.StringIO(csv_block))
+    all_rows = list(reader)
+
+    if not all_rows:
+        return csv_text
+
+    headers = [h.strip() for h in all_rows[0]]
+    data_rows = all_rows[1:]
+    col_map = _detect_vesting_columns(headers)
+
+    date_shift = timedelta(days=rng.randint(*config.date_shift_days))
+
+    # Symbol mapping
+    symbol_col = col_map.get("symbol")
+    name_col = col_map.get("name")
+    real_symbols: set[str] = set()
+    if symbol_col is not None:
+        for row in data_rows:
+            if symbol_col < len(row):
+                val = row[symbol_col].strip().strip('"')
+                if val and val.lower() not in ("total", ""):
+                    real_symbols.add(val)
+
+    fake_pool = list(_FAKE_COMPANIES)
+    rng.shuffle(fake_pool)
+    symbol_mapping: dict[str, tuple[str, str]] = {}
+    for i, sym in enumerate(sorted(real_symbols)):
+        symbol_mapping[sym] = fake_pool[i % len(fake_pool)]
+
+    price_factor = rng.uniform(*config.price_shift_range)
+    qty_factor = rng.uniform(*config.quantity_shift_range)
+
+    # Title rows above header
+    output_lines: list[str] = []
+    for i in range(header_idx):
+        line = lines[i]
+        line = re.sub(r"\.\.\.\d{3,}", "...XXX", line)
+        def _shift_title_date(m: re.Match[str]) -> str:
+            dt = _parse_date(m.group(0))
+            return _format_date(dt + date_shift, m.group(0)) if dt else m.group(0)
+        line = re.sub(r"\d{2}/\d{2}/\d{4}", _shift_title_date, line)
+        line = re.sub(
+            r"(as of\s+)\w+ \w+ \d+ \s*\d+:\d+:\d+ \w+ \d{4}",
+            r"\1[redacted]",
+            line,
+        )
+        for real_sym, (fake_sym, _) in symbol_mapping.items():
+            line = line.replace(real_sym, fake_sym)
+        output_lines.append(line)
+
+    # Header row
+    buf = io.StringIO()
+    writer = csv.writer(buf, quoting=csv.QUOTE_ALL)
+    writer.writerow(headers)
+    output_lines.append(buf.getvalue().strip())
+
+    # Data rows
+    date_col = col_map.get("date")
+    shares_vested_col = col_map.get("shares_vested")
+    shares_delivered_col = col_map.get("shares_delivered")
+    shares_withheld_col = col_map.get("shares_withheld")
+    fmv_col = col_map.get("fmv")
+    value_col = col_map.get("value")
+    award_id_col = col_map.get("award_id")
+    tax_withheld_col = col_map.get("tax_withheld")
+
+    for row in data_rows:
+        if len(row) < len(headers):
+            row.extend([""] * (len(headers) - len(row)))
+
+        # Skip empty / total rows
+        is_empty = all(not cell.strip() for cell in row)
+        if is_empty:
+            continue
+
+        # Symbol + name
+        if symbol_col is not None:
+            orig_sym = row[symbol_col].strip().strip('"')
+            if orig_sym in symbol_mapping:
+                fake_sym, fake_name = symbol_mapping[orig_sym]
+                row[symbol_col] = fake_sym
+                if name_col is not None:
+                    row[name_col] = fake_name
+
+        # Date
+        if date_col is not None and date_col < len(row):
+            orig = row[date_col].strip()
+            dt = _parse_date(orig)
+            if dt:
+                row[date_col] = _format_date(dt + date_shift, orig)
+
+        # Shares — scale consistently
+        new_vested = None
+        if shares_vested_col is not None:
+            orig = _parse_currency(row[shares_vested_col])
+            if orig is not None and orig != 0:
+                new_vested = max(1, round(orig * qty_factor))
+                row[shares_vested_col] = str(new_vested)
+
+        if shares_delivered_col is not None:
+            orig = _parse_currency(row[shares_delivered_col])
+            if orig is not None and orig != 0:
+                row[shares_delivered_col] = str(max(1, round(orig * qty_factor)))
+
+        if shares_withheld_col is not None:
+            orig = _parse_currency(row[shares_withheld_col])
+            if orig is not None and orig != 0:
+                row[shares_withheld_col] = str(max(0, round(orig * qty_factor)))
+
+        # FMV per share
+        new_fmv = None
+        if fmv_col is not None:
+            orig = _parse_currency(row[fmv_col])
+            if orig is not None and orig != 0:
+                new_fmv = round(orig * price_factor, 2)
+                row[fmv_col] = _format_currency(new_fmv, row[fmv_col])
+
+        # Total value — recompute if we have both FMV and shares
+        if value_col is not None:
+            orig = _parse_currency(row[value_col])
+            if orig is not None and orig != 0:
+                if new_fmv is not None and new_vested is not None:
+                    row[value_col] = _format_currency(
+                        round(new_fmv * new_vested, 2), row[value_col]
+                    )
+                else:
+                    row[value_col] = _format_currency(
+                        round(orig * price_factor * qty_factor, 2), row[value_col]
+                    )
+
+        # Tax withheld
+        if tax_withheld_col is not None:
+            orig = _parse_currency(row[tax_withheld_col])
+            if orig is not None and orig != 0:
+                row[tax_withheld_col] = _format_currency(
+                    round(orig * price_factor * qty_factor, 2), row[tax_withheld_col]
+                )
+
+        # Award ID — randomize
+        if award_id_col is not None and row[award_id_col].strip():
+            row[award_id_col] = f"AWD-{rng.randint(100000, 999999)}"
+
+        buf = io.StringIO()
+        writer = csv.writer(buf, quoting=csv.QUOTE_ALL)
+        writer.writerow(row)
+        output_lines.append(buf.getvalue().strip())
+
+    return "\n".join(output_lines) + "\n"
+
+
+# ── 1042-S PDF anonymization ──────────────────────────────────────────────
+
+def anonymize_1042s_pdf(input_path: str, output_path: str,
+                        config: AnonConfig | None = None) -> None:
+    """Anonymize a 1042-S PDF by extracting key data and generating a new PDF.
+
+    Since editing PDFs in-place is unreliable, we:
+    1. Extract text from the original to identify monetary amounts and the tax year
+    2. Generate a clean new PDF with randomized values in the 1042-S structure
+    """
+    from fpdf import FPDF
+    from pypdf import PdfReader
+
+    config = config or AnonConfig()
+    rng = _make_rng(config.seed)
+
+    reader = PdfReader(input_path)
+    full_text = "\n".join(page.extract_text() or "" for page in reader.pages)
+
+    # Extract the tax year
+    tax_year_match = re.search(r"20[0-9]{2}", full_text)
+    tax_year = int(tax_year_match.group()) if tax_year_match else 2025
+
+    date_shift = timedelta(days=rng.randint(*config.date_shift_days))
+    price_factor = rng.uniform(*config.price_shift_range)
+
+    # Try to extract monetary amounts from the PDF text
+    # 1042-S key fields: gross income (Box 2), tax rate (Box 3b),
+    # federal tax withheld (Box 7)
+    amounts = re.findall(r"\$?([\d,]+\.\d{2})\b", full_text)
+    parsed_amounts = []
+    for a in amounts:
+        try:
+            parsed_amounts.append(float(a.replace(",", "")))
+        except ValueError:
+            pass
+
+    # Heuristic: largest amount is likely gross income, second largest is tax withheld
+    parsed_amounts.sort(reverse=True)
+    orig_gross = parsed_amounts[0] if len(parsed_amounts) >= 1 else 50000.00
+    orig_tax = parsed_amounts[1] if len(parsed_amounts) >= 2 else orig_gross * 0.30
+
+    # Try to find withholding rate
+    rate_match = re.search(r"(\d{1,2}(?:\.\d+)?)\s*%", full_text)
+    withholding_rate = float(rate_match.group(1)) if rate_match else 30.0
+
+    # Randomize
+    new_gross = round(orig_gross * price_factor, 2)
+    new_tax = round(new_gross * withholding_rate / 100, 2)
+
+    # Generate clean PDF
+    pdf = FPDF(orientation="P", unit="mm", format="A4")
+    pdf.add_page()
+    pdf.set_auto_page_break(auto=True, margin=15)
+
+    # Title
+    pdf.set_font("Helvetica", "B", 14)
+    pdf.cell(0, 10, "Form 1042-S", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_font("Helvetica", "", 10)
+    pdf.cell(0, 6, "Foreign Person's U.S. Source Income Subject to Withholding",
+             new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 6, f"Tax Year {tax_year}  [ANONYMIZED]",
+             new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(5)
+
+    # Box layout
+    def _box(label: str, value: str) -> None:
+        pdf.set_font("Helvetica", "", 8)
+        pdf.cell(90, 5, label, new_x="LMARGIN", new_y="NEXT")
+        pdf.set_font("Helvetica", "B", 11)
+        pdf.cell(90, 7, value, new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(3)
+
+    _box("Box 1 - Income Code", "15 (Compensation for personal services)")
+    _box("Box 2 - Gross Income", f"${new_gross:,.2f}")
+    _box("Box 3 - Chapter 3 Tax Rate", f"{withholding_rate:.2f}%")
+    _box("Box 4a - Exemption Code", "")
+    _box("Box 7 - Federal Tax Withheld", f"${new_tax:,.2f}")
+    _box("Box 7a - Check if federal tax withheld was not deposited with the IRS", "")
+    _box("Box 12a - Withholding Agent's EIN", "XX-XXXXXXX")
+    _box("Box 12b - Withholding Agent's Name", "CHARLES SCHWAB & CO., INC.")
+
+    pdf.ln(5)
+    _box("Box 13a - Recipient's TIN", "XXX-XX-XXXX")
+    _box("Box 13b - Recipient's Name", "JOHN DOE")
+    _box("Box 13c - Recipient's Address", "123 EXAMPLE STRASSE, 10115 BERLIN, GERMANY")
+    _box("Box 13d - Recipient's Country Code", "DE")
+
+    pdf.ln(5)
+    pdf.set_font("Helvetica", "I", 8)
+    pdf.cell(0, 5,
+             "This is an anonymized version of a 1042-S form generated for testing purposes.",
+             new_x="LMARGIN", new_y="NEXT")
+
+    pdf.output(output_path)
+
+
+# ── File type detection & unified entry point ─────────────────────────────
+
+def _detect_file_type(path: str, text: str | None = None) -> str:
+    """Detect file type: 'realized_gains', 'vesting', or 'pdf'."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".pdf":
+        return "pdf"
+
+    # For CSVs, peek at content to distinguish realized gains from vesting
+    if text is None:
+        return "csv_unknown"
+
+    lower = text[:2000].lower()
+
+    # Realized gains: has "proceeds" or "gain/loss" or "cost basis"
+    if any(kw in lower for kw in ("proceeds", "gain/loss", "cost basis", "realized gain")):
+        return "realized_gains"
+
+    # Vesting: has "vest" or "shares delivered" or "fmv" or "fair market value"
+    if any(kw in lower for kw in ("vest", "shares delivered", "fmv", "fair market value",
+                                   "shares withheld")):
+        return "vesting"
+
+    # Fallback: treat as generic CSV and apply realized gains anonymizer
+    # (it's the more conservative option — won't break on unknown layouts)
+    return "csv_unknown"
+
+
+def anonymize_file(input_path: str, output_path: str, config: AnonConfig | None = None) -> str:
+    """Read a file, anonymize it, and write the result.
+
+    Auto-detects file type (realized gains CSV, vesting CSV, or 1042-S PDF).
+    Returns the detected file type as a string.
+    """
+    ext = os.path.splitext(input_path)[1].lower()
+
+    if ext == ".pdf":
+        anonymize_1042s_pdf(input_path, output_path, config)
+        return "pdf"
+
+    # CSV files
     for encoding in ("utf-8-sig", "latin-1"):
         try:
             with open(input_path, encoding=encoding) as f:
@@ -495,7 +854,14 @@ def anonymize_file(input_path: str, output_path: str, config: AnonConfig | None 
     else:
         raise ValueError(f"Could not decode {input_path}")
 
-    result = anonymize_realized_gains_csv(text, config)
+    file_type = _detect_file_type(input_path, text)
+
+    if file_type == "vesting":
+        result = anonymize_vesting_csv(text, config)
+    else:
+        result = anonymize_realized_gains_csv(text, config)
 
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(result)
+
+    return file_type

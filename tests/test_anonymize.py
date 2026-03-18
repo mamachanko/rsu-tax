@@ -1,12 +1,21 @@
-"""Tests for the CSV anonymization tool."""
+"""Tests for the anonymization tool (Realized G/L CSV, Vesting CSV, 1042-S PDF)."""
 
 from __future__ import annotations
 
 import csv
 import io
+import os
 import re
+import tempfile
 
-from rsu_tax.anonymize import AnonConfig, anonymize_realized_gains_csv
+from rsu_tax.anonymize import (
+    AnonConfig,
+    anonymize_1042s_pdf,
+    anonymize_realized_gains_csv,
+    anonymize_vesting_csv,
+    anonymize_file,
+    _detect_file_type,
+)
 
 SAMPLE_CSV = """\
 "Realized Gain/Loss for ...482 for 01/01/2025 to 12/31/2025 as of Sat Mar 14  09:23:17 EDT 2026","","","","","","","","","","","","","","","","","","","","","","",""
@@ -17,13 +26,19 @@ SAMPLE_CSV = """\
 "Total","","","","","","$50,371.90","$49,629.03","$742.87","1.496841458498%","$0.00","N/A","$742.87","1.496841458498372%","","","","","","","","","",""
 """
 
+SAMPLE_VESTING_CSV = """\
+"Date","Action","Symbol","Description","Shares Vested","Shares Delivered","Shares Withheld","Fair Market Value","Total Value","Award ID"
+"02/15/2025","Vest","AAPL","APPLE INC","100","67","33","$185.50","$18,550.00","RSU-2023-0042"
+"05/15/2025","Vest","AAPL","APPLE INC","100","67","33","$192.30","$19,230.00","RSU-2023-0042"
+"08/15/2025","Vest","AAPL","APPLE INC","50","34","16","$201.10","$10,055.00","RSU-2024-0015"
+"""
+
 
 def _parse_rows(csv_text: str) -> list[dict[str, str]]:
     """Parse anonymized CSV into list of dicts (skip title row)."""
     lines = csv_text.strip().splitlines()
-    # Find header
     for i, line in enumerate(lines):
-        if "Symbol" in line:
+        if "Symbol" in line or "Date" in line:
             block = "\n".join(lines[i:])
             reader = csv.DictReader(io.StringIO(block))
             return list(reader)
@@ -36,6 +51,8 @@ def _parse_currency(value: str) -> float:
         return -float(cleaned[1:-1])
     return float(cleaned) if cleaned and cleaned != "--" else 0.0
 
+
+# ── Realized Gain/Loss CSV tests ──────────────────────────────────────────
 
 class TestAnonymizeBasics:
     def test_symbol_replaced(self):
@@ -121,7 +138,6 @@ class TestAnonymizeConsistency:
             new = datetime.strptime(row["Closed Date"].strip(), "%m/%d/%Y")
             shifts.append((new - orig).days)
 
-        # All shifts should be the same
         assert len(set(shifts)) == 1, f"Inconsistent date shifts: {shifts}"
 
 
@@ -150,3 +166,218 @@ class TestAnonymizeRoundTrip:
             assert t.symbol != "AAPL"
             assert t.proceeds_usd > 0
             assert abs(t.proceeds_usd - t.cost_basis_usd - t.gain_loss_usd) < 0.02
+
+
+# ── Vesting CSV tests ─────────────────────────────────────────────────────
+
+class TestVestingAnonymize:
+    def test_symbol_replaced(self):
+        result = anonymize_vesting_csv(SAMPLE_VESTING_CSV, AnonConfig(seed=1))
+        rows = _parse_rows(result)
+        for row in rows:
+            assert row["Symbol"].strip() != "AAPL"
+            assert row["Description"].strip() != "APPLE INC"
+
+    def test_dates_shifted(self):
+        from datetime import datetime
+
+        result = anonymize_vesting_csv(SAMPLE_VESTING_CSV, AnonConfig(seed=42))
+        rows = _parse_rows(result)
+
+        original_dates = ["02/15/2025", "05/15/2025", "08/15/2025"]
+        shifts = []
+        for row, orig_str in zip(rows, original_dates):
+            orig = datetime.strptime(orig_str, "%m/%d/%Y")
+            new = datetime.strptime(row["Date"].strip(), "%m/%d/%Y")
+            shifts.append((new - orig).days)
+
+        assert len(set(shifts)) == 1, f"Inconsistent date shifts: {shifts}"
+
+    def test_quantities_scaled(self):
+        result = anonymize_vesting_csv(SAMPLE_VESTING_CSV, AnonConfig(seed=1))
+        rows = _parse_rows(result)
+        original_vested = [100, 100, 50]
+        for row, orig in zip(rows, original_vested):
+            new = int(row["Shares Vested"].strip())
+            assert new != orig
+
+    def test_fmv_shifted(self):
+        result = anonymize_vesting_csv(SAMPLE_VESTING_CSV, AnonConfig(seed=1))
+        rows = _parse_rows(result)
+        original_fmv = [185.50, 192.30, 201.10]
+        for row, orig in zip(rows, original_fmv):
+            new = _parse_currency(row["Fair Market Value"])
+            assert new != orig
+
+    def test_award_ids_randomized(self):
+        result = anonymize_vesting_csv(SAMPLE_VESTING_CSV, AnonConfig(seed=1))
+        rows = _parse_rows(result)
+        for row in rows:
+            assert row["Award ID"].strip().startswith("AWD-")
+            assert row["Award ID"].strip() != "RSU-2023-0042"
+            assert row["Award ID"].strip() != "RSU-2024-0015"
+
+    def test_total_value_consistent_with_fmv_times_shares(self):
+        result = anonymize_vesting_csv(SAMPLE_VESTING_CSV, AnonConfig(seed=42))
+        rows = _parse_rows(result)
+        for row in rows:
+            fmv = _parse_currency(row["Fair Market Value"])
+            shares = int(row["Shares Vested"].strip())
+            value = _parse_currency(row["Total Value"])
+            assert abs(value - fmv * shares) < 0.02, (
+                f"Value {value} != FMV {fmv} * shares {shares}"
+            )
+
+    def test_reproducible(self):
+        r1 = anonymize_vesting_csv(SAMPLE_VESTING_CSV, AnonConfig(seed=99))
+        r2 = anonymize_vesting_csv(SAMPLE_VESTING_CSV, AnonConfig(seed=99))
+        assert r1 == r2
+
+
+# ── 1042-S PDF tests ──────────────────────────────────────────────────────
+
+def _make_test_1042s_pdf(path: str, gross: float = 75432.18, rate: float = 30.0) -> None:
+    """Create a minimal test 1042-S PDF."""
+    from fpdf import FPDF
+
+    tax = round(gross * rate / 100, 2)
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Helvetica", "B", 14)
+    pdf.cell(0, 10, "Form 1042-S  Tax Year 2025", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_font("Helvetica", "", 10)
+    pdf.cell(0, 7, f"Box 2 - Gross Income: ${gross:,.2f}", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 7, f"Box 3 - Tax Rate: {rate:.2f}%", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 7, f"Box 7 - Federal Tax Withheld: ${tax:,.2f}",
+             new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 7, "Recipient: Jane Smith  TIN: 123-45-6789",
+             new_x="LMARGIN", new_y="NEXT")
+    pdf.output(path)
+
+
+class TestPdfAnonymize:
+    def test_generates_valid_pdf(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = os.path.join(tmpdir, "1042s.pdf")
+            dst = os.path.join(tmpdir, "1042s-anon.pdf")
+            _make_test_1042s_pdf(src)
+            anonymize_1042s_pdf(src, dst, AnonConfig(seed=42))
+
+            assert os.path.isfile(dst)
+            assert os.path.getsize(dst) > 100
+
+    def test_contains_anonymized_marker(self):
+        from pypdf import PdfReader
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = os.path.join(tmpdir, "1042s.pdf")
+            dst = os.path.join(tmpdir, "1042s-anon.pdf")
+            _make_test_1042s_pdf(src)
+            anonymize_1042s_pdf(src, dst, AnonConfig(seed=42))
+
+            reader = PdfReader(dst)
+            text = "\n".join(page.extract_text() or "" for page in reader.pages)
+            assert "[ANONYMIZED]" in text
+            assert "JOHN DOE" in text  # placeholder name
+            assert "XXX-XX-XXXX" in text  # placeholder TIN
+
+    def test_amounts_differ_from_original(self):
+        from pypdf import PdfReader
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = os.path.join(tmpdir, "1042s.pdf")
+            dst = os.path.join(tmpdir, "1042s-anon.pdf")
+            _make_test_1042s_pdf(src, gross=75432.18)
+            anonymize_1042s_pdf(src, dst, AnonConfig(seed=42))
+
+            reader = PdfReader(dst)
+            text = "\n".join(page.extract_text() or "" for page in reader.pages)
+            assert "$75,432.18" not in text
+
+    def test_no_original_personal_info(self):
+        from pypdf import PdfReader
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = os.path.join(tmpdir, "1042s.pdf")
+            dst = os.path.join(tmpdir, "1042s-anon.pdf")
+            _make_test_1042s_pdf(src)
+            anonymize_1042s_pdf(src, dst, AnonConfig(seed=42))
+
+            reader = PdfReader(dst)
+            text = "\n".join(page.extract_text() or "" for page in reader.pages)
+            assert "Jane Smith" not in text
+            assert "123-45-6789" not in text
+
+    def test_tax_equals_rate_times_gross(self):
+        from pypdf import PdfReader
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = os.path.join(tmpdir, "1042s.pdf")
+            dst = os.path.join(tmpdir, "1042s-anon.pdf")
+            _make_test_1042s_pdf(src, gross=50000.00, rate=30.0)
+            anonymize_1042s_pdf(src, dst, AnonConfig(seed=42))
+
+            reader = PdfReader(dst)
+            text = "\n".join(page.extract_text() or "" for page in reader.pages)
+
+            # Extract the gross and tax amounts from the output
+            amounts = re.findall(r"\$([\d,]+\.\d{2})", text)
+            parsed = [float(a.replace(",", "")) for a in amounts]
+            # First amount should be gross, second should be tax
+            gross = parsed[0]
+            tax = parsed[1]
+            assert abs(tax - gross * 0.30) < 0.02
+
+
+# ── File type detection tests ─────────────────────────────────────────────
+
+class TestFileTypeDetection:
+    def test_detects_realized_gains(self):
+        assert _detect_file_type("data.csv", SAMPLE_CSV) == "realized_gains"
+
+    def test_detects_vesting(self):
+        assert _detect_file_type("vest.csv", SAMPLE_VESTING_CSV) == "vesting"
+
+    def test_detects_pdf_by_extension(self):
+        assert _detect_file_type("form.pdf") == "pdf"
+
+    def test_unknown_csv(self):
+        generic = '"Col1","Col2"\n"a","b"\n'
+        assert _detect_file_type("data.csv", generic) == "csv_unknown"
+
+
+# ── anonymize_file integration tests ──────────────────────────────────────
+
+class TestAnonymizeFileIntegration:
+    def test_realized_gains_csv(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = os.path.join(tmpdir, "gains.csv")
+            dst = os.path.join(tmpdir, "gains-anon.csv")
+            with open(src, "w") as f:
+                f.write(SAMPLE_CSV)
+            file_type = anonymize_file(src, dst, AnonConfig(seed=42))
+            assert file_type == "realized_gains"
+            assert os.path.isfile(dst)
+            with open(dst) as f:
+                assert "AAPL" not in f.read()
+
+    def test_vesting_csv(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = os.path.join(tmpdir, "vest.csv")
+            dst = os.path.join(tmpdir, "vest-anon.csv")
+            with open(src, "w") as f:
+                f.write(SAMPLE_VESTING_CSV)
+            file_type = anonymize_file(src, dst, AnonConfig(seed=42))
+            assert file_type == "vesting"
+            assert os.path.isfile(dst)
+            with open(dst) as f:
+                assert "AAPL" not in f.read()
+
+    def test_pdf(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = os.path.join(tmpdir, "1042s.pdf")
+            dst = os.path.join(tmpdir, "1042s-anon.pdf")
+            _make_test_1042s_pdf(src)
+            file_type = anonymize_file(src, dst, AnonConfig(seed=42))
+            assert file_type == "pdf"
+            assert os.path.isfile(dst)
