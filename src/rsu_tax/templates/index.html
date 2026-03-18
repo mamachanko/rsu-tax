@@ -203,7 +203,7 @@
   <h1>RSU Tax Calculator</h1>
   <p>Import your Schwab Realized Gain/Loss CSV and get EUR capital gains for your German tax return in seconds.</p>
   <div style="margin-bottom:1.5rem">
-    <button type="button" class="info-link" onclick="document.getElementById('info-overlay').classList.add('open')">? How do I get this data?</button>
+    <button type="button" class="info-link" onclick="document.getElementById('info-overlay').classList.add('open')">How do I get this data?</button>
   </div>
 
   <form
@@ -232,9 +232,11 @@
       <a class="chip-change" id="chip-change">change</a>
     </div>
 
-    <div class="upload-actions" id="upload-actions" style="display:none">
-      <span id="upload-spinner" class="htmx-indicator spinner"></span>
-      <span style="color:var(--text-muted);font-size:0.82rem">Calculating…</span>
+    <div class="upload-actions">
+      <button type="submit" class="btn btn-primary" id="upload-btn" disabled>
+        <span id="upload-spinner" class="htmx-indicator spinner"></span>
+        Calculate
+      </button>
     </div>
   </form>
 
@@ -324,29 +326,26 @@
   const chip     = document.getElementById("file-chip");
   const chipName = document.getElementById("chip-name");
   const chipChg  = document.getElementById("chip-change");
-  const actions  = document.getElementById("upload-actions");
-  const form     = document.getElementById("upload-form");
+  const btn      = document.getElementById("upload-btn");
 
-  function showChipAndSubmit(name) {
+  function showChip(name) {
     zone.style.display = "none";
     chipName.textContent = name;
     chip.style.display = "flex";
-    actions.style.display = "flex";
-    // Auto-submit via HTMX
-    htmx.trigger(form, "submit");
+    btn.disabled = false;
   }
 
   function showZone() {
     chip.style.display = "none";
-    actions.style.display = "none";
     zone.style.display = "";
     input.value = "";
+    btn.disabled = true;
   }
 
   chipChg.addEventListener("click", showZone);
 
   input.addEventListener("change", () => {
-    if (input.files[0]) showChipAndSubmit(input.files[0].name);
+    if (input.files[0]) showChip(input.files[0].name);
   });
 
   ["dragenter","dragover"].forEach(e => zone.addEventListener(e, ev => {
@@ -357,7 +356,7 @@
   }));
   zone.addEventListener("drop", ev => {
     const f = ev.dataTransfer?.files[0];
-    if (f) { input.files = ev.dataTransfer.files; showChipAndSubmit(f.name); }
+    if (f) { input.files = ev.dataTransfer.files; showChip(f.name); }
   });
 
   // Close info overlay on Escape
