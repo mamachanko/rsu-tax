@@ -986,10 +986,13 @@ def _create_overlay_page(
     for frag, new_text in replacements:
         font_size = frag.font_size if frag.font_size > 0 else 8.0
 
+        # Sanitize text for fpdf's Helvetica (latin-1 only)
+        safe_text = new_text.encode("latin-1", errors="replace").decode("latin-1")
+
         # Estimate text width for the white cover rectangle
         # Approximate: each character is ~0.6 * font_size points wide
         orig_width = len(frag.text) * font_size * 0.55
-        new_width = len(new_text) * font_size * 0.55
+        new_width = len(safe_text) * font_size * 0.55
         cover_width = max(orig_width, new_width) + 4  # small padding
 
         # PDF coordinates: origin at bottom-left
@@ -1008,7 +1011,7 @@ def _create_overlay_page(
         # Draw replacement text
         pdf.set_font("Helvetica", "", font_size)
         pdf.set_text_color(0, 0, 0)
-        pdf.text(x_pt, y_pt + font_size * 0.75, new_text)
+        pdf.text(x_pt, y_pt + font_size * 0.75, safe_text)
 
     return pdf.output()
 
