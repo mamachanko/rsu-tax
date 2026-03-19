@@ -994,8 +994,9 @@ def _process_content_stream(
     date_shift: timedelta,
     replace_names: bool,
 ) -> bytes:
-    """Walk a raw PDF content stream, find all literal strings, and apply
-    anonymization replacements in-place.  Returns modified stream bytes.
+    """Walk a raw PDF content stream, find all literal strings and hex
+    strings, and apply anonymization replacements in-place.
+    Returns modified stream bytes.
     """
     result = bytearray()
     i = 0
@@ -1016,12 +1017,18 @@ def _process_content_stream(
             result.extend(b")")
             i = end_pos
         elif data[i : i + 1] == b"<" and i + 1 < len(data) and data[i + 1 : i + 2] != b"<":
-            # Hex string <...> — leave as-is
+            # Hex string <hex_digits>
             end = data.find(b">", i)
             if end == -1:
                 result.extend(data[i:])
                 break
-            result.extend(data[i : end + 1])
+            hex_content = data[i + 1 : end]
+            new_hex = _process_hex_string(
+                hex_content, rng, price_factor, date_shift, replace_names,
+            )
+            result.extend(b"<")
+            result.extend(new_hex)
+            result.extend(b">")
             i = end + 1
         else:
             result.append(data[i])
@@ -1030,17 +1037,171 @@ def _process_content_stream(
     return bytes(result)
 
 
+def _process_hex_string(
+    hex_content: bytes,
+    rng: "random.Random",
+    price_factor: float,
+    date_shift: timedelta,
+    replace_names: bool,
+) -> bytes:
+    """Process a PDF hex string (the content between < and >)."""
+    try:
+        hex_str = hex_content.decode("ascii").strip()
+        if not hex_str:
+            return hex_content
+        # Pad odd-length hex strings
+        if len(hex_str) % 2:
+            hex_str += "0"
+        raw_bytes = bytes.fromhex(hex_str)
+    except (ValueError, UnicodeDecodeError):
+        return hex_content
+
+    new_bytes = _anonymize_pdf_string(
+        raw_bytes, rng, price_factor, date_shift, replace_names,
+    )
+    if new_bytes is raw_bytes:
+        return hex_content
+    return new_bytes.hex().upper().encode("ascii")
+
+
+def _is_instruction_page(page_text: str) -> bool:
+    """Detect if a page is an instruction/explanation page.
+
+    Instruction pages are dense with prose text. Form pages have short
+    field labels and values. We check for:
+    - Very high text volume (>8000 chars)
+    - OR presence of prose indicators (long sentences, paragraph structure)
+    """
+    if len(page_text) > 8000:
+        return True
+    # Check for prose: long lines with many lowercase words
+    lines = page_text.split("\n")
+    long_prose_lines = sum(
+        1 for line in lines
+        if len(line) > 80 and sum(1 for c in line if c.islower()) > len(line) * 0.3
+    )
+    return long_prose_lines > 5
+
+
+def _process_stream_data(
+    raw: bytes,
+    rng: "random.Random",
+    price_factor: float,
+    date_shift: timedelta,
+    replace_names: bool,
+) -> tuple[bytes, bool]:
+    """Process a single content stream.  Returns (modified_data, changed)."""
+    modified = _process_content_stream(
+        raw, rng, price_factor, date_shift, replace_names,
+    )
+    return modified, modified != raw
+
+
+def _process_page_streams(
+    page: "PageObject",
+    writer: "PdfWriter",
+    rng: "random.Random",
+    price_factor: float,
+    date_shift: timedelta,
+    replace_names: bool,
+) -> None:
+    """Process all content streams on a page: direct contents, XObject Form
+    streams, and annotation appearance streams."""
+    from pypdf.generic import (
+        ArrayObject,
+        DecodedStreamObject,
+        DictionaryObject,
+        NameObject,
+    )
+
+    # ── 1) Direct page content stream(s) ──────────────────────────────
+    contents_ref = page.get("/Contents")
+    if contents_ref is not None:
+        contents_obj = contents_ref.get_object()
+
+        if isinstance(contents_obj, ArrayObject):
+            for idx, item_ref in enumerate(contents_obj):
+                stream_obj = item_ref.get_object()
+                raw = stream_obj.get_data()
+                modified, changed = _process_stream_data(
+                    raw, rng, price_factor, date_shift, replace_names,
+                )
+                if changed:
+                    new_stream = DecodedStreamObject()
+                    new_stream.set_data(modified)
+                    contents_obj[idx] = writer._add_object(new_stream)
+        else:
+            raw = contents_obj.get_data()
+            modified, changed = _process_stream_data(
+                raw, rng, price_factor, date_shift, replace_names,
+            )
+            if changed:
+                new_stream = DecodedStreamObject()
+                new_stream.set_data(modified)
+                page[NameObject("/Contents")] = writer._add_object(new_stream)
+
+    # ── 2) Form XObject streams (where form field values often live) ──
+    resources = page.get("/Resources")
+    if resources is not None:
+        resources_obj = resources.get_object() if hasattr(resources, "get_object") else resources
+        xobjects = resources_obj.get("/XObject")
+        if xobjects is not None:
+            xobj_dict = xobjects.get_object() if hasattr(xobjects, "get_object") else xobjects
+            for name in list(xobj_dict.keys()):
+                xobj_ref = xobj_dict[name]
+                xobj = xobj_ref.get_object() if hasattr(xobj_ref, "get_object") else xobj_ref
+                if not hasattr(xobj, "get") or xobj.get("/Subtype") != "/Form":
+                    continue
+                try:
+                    raw = xobj.get_data()
+                except Exception:
+                    continue
+                modified, changed = _process_stream_data(
+                    raw, rng, price_factor, date_shift, replace_names,
+                )
+                if changed:
+                    xobj.set_data(modified)
+
+    # ── 3) Annotation appearance streams (form field widgets) ─────────
+    annots = page.get("/Annots")
+    if annots is not None:
+        annots_obj = annots.get_object() if hasattr(annots, "get_object") else annots
+        if isinstance(annots_obj, ArrayObject):
+            for annot_ref in annots_obj:
+                annot = annot_ref.get_object() if hasattr(annot_ref, "get_object") else annot_ref
+                if not isinstance(annot, DictionaryObject):
+                    continue
+                ap = annot.get("/AP")
+                if ap is None:
+                    continue
+                ap_obj = ap.get_object() if hasattr(ap, "get_object") else ap
+                # Normal appearance
+                n_ref = ap_obj.get("/N")
+                if n_ref is None:
+                    continue
+                n_obj = n_ref.get_object() if hasattr(n_ref, "get_object") else n_ref
+                if not hasattr(n_obj, "get_data"):
+                    continue
+                try:
+                    raw = n_obj.get_data()
+                except Exception:
+                    continue
+                modified, changed = _process_stream_data(
+                    raw, rng, price_factor, date_shift, replace_names,
+                )
+                if changed:
+                    n_obj.set_data(modified)
+
+
 def anonymize_1042s_pdf(
     input_path: str, output_path: str, config: AnonConfig | None = None,
 ) -> None:
     """Anonymize a 1042-S PDF by modifying text in the content streams.
 
-    Instead of overlaying, this directly replaces sensitive text (amounts,
-    TINs, dates, names) inside each page's content stream operators.
-    The text stays at exactly the same position with the same font.
+    Processes: page content streams, Form XObject streams, and annotation
+    appearance streams.  Text stays at exactly the same position.
     """
     from pypdf import PdfReader, PdfWriter
-    from pypdf.generic import ArrayObject, DecodedStreamObject, NameObject
 
     config = config or AnonConfig()
     rng = _make_rng(config.seed)
@@ -1054,61 +1215,58 @@ def anonymize_1042s_pdf(
     for page_idx in range(len(writer.pages)):
         page = writer.pages[page_idx]
 
-        # Detect instruction pages by text density — skip name replacement
-        # on pages with lots of text (instructions, explanations).
+        # Detect instruction pages — skip name replacement on prose-heavy pages
         page_text = reader.pages[page_idx].extract_text() or ""
-        is_form_page = len(page_text) < 3000
-        replace_names = is_form_page
+        replace_names = not _is_instruction_page(page_text)
 
-        # Get the raw content stream data
-        contents_ref = page.get("/Contents")
-        if contents_ref is None:
-            continue
-
-        contents_obj = contents_ref.get_object()
-
-        if isinstance(contents_obj, ArrayObject):
-            # Multiple content streams — process each one
-            for idx, item_ref in enumerate(contents_obj):
-                stream_obj = item_ref.get_object()
-                raw = stream_obj.get_data()
-                modified = _process_content_stream(
-                    raw, rng, price_factor, date_shift, replace_names,
-                )
-                if modified != raw:
-                    new_stream = DecodedStreamObject()
-                    new_stream.set_data(modified)
-                    contents_obj[idx] = writer._add_object(new_stream)
-        else:
-            # Single content stream
-            raw = contents_obj.get_data()
-            modified = _process_content_stream(
-                raw, rng, price_factor, date_shift, replace_names,
-            )
-            if modified != raw:
-                new_stream = DecodedStreamObject()
-                new_stream.set_data(modified)
-                page[NameObject("/Contents")] = writer._add_object(new_stream)
+        _process_page_streams(
+            page, writer, rng, price_factor, date_shift, replace_names,
+        )
 
     with open(output_path, "wb") as f:
         writer.write(f)
 
 
-def debug_pdf_extraction(input_path: str, config: AnonConfig | None = None) -> str:
-    """Diagnostic: show content stream text strings and planned replacements.
+def _count_stream_strings(raw: bytes) -> tuple[int, int]:
+    """Count total literal/hex strings and non-empty ones in a content stream."""
+    total = 0
+    non_empty = 0
+    i = 0
+    while i < len(raw):
+        if raw[i : i + 1] == b"(":
+            string_bytes, end_pos = _parse_pdf_string(raw, i)
+            total += 1
+            try:
+                if string_bytes.decode("latin-1").strip():
+                    non_empty += 1
+            except Exception:
+                pass
+            i = end_pos
+        elif raw[i : i + 1] == b"<" and i + 1 < len(raw) and raw[i + 1 : i + 2] != b"<":
+            end = raw.find(b">", i)
+            if end == -1:
+                break
+            total += 1
+            hex_str = raw[i + 1 : end].decode("ascii", errors="ignore").strip()
+            if hex_str:
+                non_empty += 1
+            i = end + 1
+        else:
+            i += 1
+    return total, non_empty
 
-    Returns a human-readable report. Useful for debugging anonymization
-    on a specific PDF.
+
+def debug_pdf_extraction(input_path: str, config: AnonConfig | None = None) -> str:
+    """Diagnostic: show content stream structure and text strings per page.
+
+    Reports direct content streams, XObject Form streams, and annotation
+    appearance streams.
     """
     from pypdf import PdfReader
-    from pypdf.generic import ArrayObject
+    from pypdf.generic import ArrayObject, DictionaryObject
 
     config = config or AnonConfig()
-    rng = _make_rng(config.seed)
     reader = PdfReader(input_path)
-
-    price_factor = rng.uniform(*config.price_shift_range)
-    date_shift = timedelta(days=rng.randint(*config.date_shift_days))
 
     lines: list[str] = []
     lines.append(f"PDF: {input_path}")
@@ -1118,63 +1276,65 @@ def debug_pdf_extraction(input_path: str, config: AnonConfig | None = None) -> s
     for page_idx, page in enumerate(reader.pages):
         mediabox = page.mediabox
         page_text = page.extract_text() or ""
-        is_form_page = len(page_text) < 3000
+        is_instruction = _is_instruction_page(page_text)
 
         lines.append(f"--- Page {page_idx} ---")
         lines.append(f"  MediaBox: {mediabox}")
         lines.append(f"  Text length: {len(page_text)} chars")
-        lines.append(f"  Type: {'form' if is_form_page else 'instruction (name replacement skipped)'}")
+        lines.append(f"  Type: {'instruction (name replacement skipped)' if is_instruction else 'form'}")
 
-        # Extract all literal strings from content stream
+        # Direct content streams
         contents_ref = page.get("/Contents")
-        if contents_ref is None:
-            lines.append("  No content stream")
-            continue
-
-        contents_obj = contents_ref.get_object()
-        if isinstance(contents_obj, ArrayObject):
-            raw_parts = [item.get_object().get_data() for item in contents_obj]
-            raw = b"\n".join(raw_parts)
-        else:
-            raw = contents_obj.get_data()
-
-        # Find all literal strings
-        string_count = 0
-        replacement_count = 0
-        i = 0
-        while i < len(raw):
-            if raw[i : i + 1] == b"(":
-                string_bytes, end_pos = _parse_pdf_string(raw, i)
-                try:
-                    text = string_bytes.decode("latin-1")
-                except Exception:
-                    text = repr(string_bytes)
-
-                if text.strip():
-                    # Check what replacement would be made
-                    test_rng = _make_rng(config.seed)
-                    # Advance rng to match
-                    test_rng.uniform(*config.price_shift_range)
-                    test_rng.randint(*config.date_shift_days)
-                    new_bytes = _anonymize_pdf_string(
-                        string_bytes, rng, price_factor, date_shift, is_form_page,
-                    )
-                    try:
-                        new_text = new_bytes.decode("latin-1")
-                    except Exception:
-                        new_text = repr(new_bytes)
-
-                    if new_text != text:
-                        lines.append(f"  [{string_count:3d}] {text!r}")
-                        lines.append(f"         -> {new_text!r}")
-                        replacement_count += 1
-                    string_count += 1
-
-                i = end_pos
+        if contents_ref is not None:
+            contents_obj = contents_ref.get_object()
+            if isinstance(contents_obj, ArrayObject):
+                for idx, item_ref in enumerate(contents_obj):
+                    raw = item_ref.get_object().get_data()
+                    total, non_empty = _count_stream_strings(raw)
+                    lines.append(f"  Content stream [{idx}]: {len(raw)} bytes, {non_empty}/{total} strings")
             else:
-                i += 1
+                raw = contents_obj.get_data()
+                total, non_empty = _count_stream_strings(raw)
+                lines.append(f"  Content stream: {len(raw)} bytes, {non_empty}/{total} strings")
+        else:
+            lines.append("  No content stream")
 
-        lines.append(f"  Strings: {string_count}, Replacements: {replacement_count}")
+        # XObject Form streams
+        resources = page.get("/Resources")
+        if resources is not None:
+            res_obj = resources.get_object() if hasattr(resources, "get_object") else resources
+            xobjects = res_obj.get("/XObject")
+            if xobjects is not None:
+                xobj_dict = xobjects.get_object() if hasattr(xobjects, "get_object") else xobjects
+                for name in sorted(xobj_dict.keys()):
+                    xobj_ref = xobj_dict[name]
+                    xobj = xobj_ref.get_object() if hasattr(xobj_ref, "get_object") else xobj_ref
+                    subtype = xobj.get("/Subtype", "?")
+                    if subtype == "/Form" and hasattr(xobj, "get_data"):
+                        try:
+                            raw = xobj.get_data()
+                            total, non_empty = _count_stream_strings(raw)
+                            lines.append(f"  XObject {name}: Form, {len(raw)} bytes, {non_empty}/{total} strings")
+                        except Exception as e:
+                            lines.append(f"  XObject {name}: Form, error: {e}")
+                    else:
+                        lines.append(f"  XObject {name}: {subtype}")
+
+        # Annotations
+        annots = page.get("/Annots")
+        if annots is not None:
+            annots_obj = annots.get_object() if hasattr(annots, "get_object") else annots
+            if isinstance(annots_obj, ArrayObject):
+                annot_count = len(annots_obj)
+                ap_count = 0
+                for annot_ref in annots_obj:
+                    annot = annot_ref.get_object() if hasattr(annot_ref, "get_object") else annot_ref
+                    if isinstance(annot, DictionaryObject):
+                        ap = annot.get("/AP")
+                        if ap is not None:
+                            ap_count += 1
+                lines.append(f"  Annotations: {annot_count} total, {ap_count} with appearance streams")
+
         lines.append("")
 
     return "\n".join(lines)
