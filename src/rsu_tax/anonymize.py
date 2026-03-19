@@ -772,21 +772,50 @@ class _TextFragment:
     page_idx: int
 
 
-def _extract_text_with_positions(reader: "PdfReader") -> list[_TextFragment]:
-    """Extract all text fragments from a PDF with their positions."""
-    from pypdf import PdfReader as _  # just for type hint
+def _mult_matrix(a: list[float], b: list[float]) -> list[float]:
+    """Multiply two PDF transformation matrices (6-element arrays).
 
+    PDF matrices are stored as [a, b, c, d, e, f] representing:
+        | a  b  0 |
+        | c  d  0 |
+        | e  f  1 |
+    """
+    return [
+        a[0] * b[0] + a[1] * b[2],
+        a[0] * b[1] + a[1] * b[3],
+        a[2] * b[0] + a[3] * b[2],
+        a[2] * b[1] + a[3] * b[3],
+        a[4] * b[0] + a[5] * b[2] + b[4],
+        a[4] * b[1] + a[5] * b[3] + b[5],
+    ]
+
+
+def _extract_text_with_positions(reader: "PdfReader") -> list[_TextFragment]:
+    """Extract all text fragments from a PDF with their positions.
+
+    Uses the full transformation (tm * cm) for accurate coordinates in
+    complex PDFs that use non-identity current transformation matrices.
+    """
     fragments: list[_TextFragment] = []
 
     for page_idx, page in enumerate(reader.pages):
         def visitor(text: str, cm: list, tm: list, font_dict: dict, font_size: float,
                     _page_idx: int = page_idx) -> None:
             if text.strip():
+                # Combine text matrix with current transformation matrix
+                # for accurate coordinates in complex PDFs.
+                final = _mult_matrix(tm, cm)
+                # Effective font size accounts for scaling in the matrices.
+                scale_y = abs(final[3]) if final[3] != 0 else abs(final[1])
+                effective_size = font_size * scale_y if scale_y and font_size else (font_size or 8.0)
+                # If effective size is unreasonably small or large, fall back
+                if effective_size < 1 or effective_size > 100:
+                    effective_size = font_size if font_size and font_size > 0 else 8.0
                 fragments.append(_TextFragment(
                     text=text.strip(),
-                    x=tm[4],
-                    y=tm[5],
-                    font_size=font_size or 8.0,
+                    x=final[4],
+                    y=final[5],
+                    font_size=effective_size,
                     page_idx=_page_idx,
                 ))
         page.extract_text(visitor_text=visitor)
@@ -970,50 +999,73 @@ def _create_overlay_page(
 ) -> bytes:
     """Create a single-page PDF overlay with white boxes + replacement text.
 
-    Coordinates: pypdf gives positions in PDF units (points, 1pt = 1/72 inch)
-    with origin at bottom-left. fpdf uses mm with origin at top-left.
+    Uses raw PDF content stream for precise coordinate control instead of
+    fpdf's top-left coordinate system, avoiding y-coordinate conversion bugs.
     """
-    from fpdf import FPDF
-
-    # Convert points to mm
-    w_mm = page_width * 25.4 / 72
-    h_mm = page_height * 25.4 / 72
-
-    pdf = FPDF(orientation="P", unit="pt", format=(page_width, page_height))
-    pdf.add_page()
-    pdf.set_auto_page_break(auto=False)
+    # Build a raw PDF content stream directly in PDF coordinate space
+    # (origin at bottom-left, same as pypdf's extracted coordinates).
+    # This avoids all the fpdf coordinate transformation issues.
+    ops: list[str] = []
 
     for frag, new_text in replacements:
         font_size = frag.font_size if frag.font_size > 0 else 8.0
 
-        # Sanitize text for fpdf's Helvetica (latin-1 only)
+        # Sanitize text for PDF string (latin-1, escape parens and backslash)
         safe_text = new_text.encode("latin-1", errors="replace").decode("latin-1")
+        escaped = safe_text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
 
-        # Estimate text width for the white cover rectangle
-        # Approximate: each character is ~0.6 * font_size points wide
+        # Estimate text width
         orig_width = len(frag.text) * font_size * 0.55
         new_width = len(safe_text) * font_size * 0.55
-        cover_width = max(orig_width, new_width) + 4  # small padding
+        cover_width = max(orig_width, new_width) + 4
 
-        # PDF coordinates: origin at bottom-left
-        # fpdf coordinates: origin at top-left
-        # Convert: fpdf_y = page_height - pdf_y
-        x_pt = frag.x
-        y_pt = page_height - frag.y  # convert to top-left origin
+        x = frag.x
+        y = frag.y
 
-        # Draw white rectangle to cover original text
-        pdf.set_fill_color(255, 255, 255)
-        pdf.set_draw_color(255, 255, 255)
-        rect_y = y_pt - 2  # small padding above
-        rect_h = font_size + 4
-        pdf.rect(x_pt - 1, rect_y, cover_width, rect_h, style="F")
+        # White rectangle to cover original text
+        # rect_y places the rectangle slightly below the baseline
+        ops.append("1 1 1 rg")  # white fill
+        ops.append(f"{x - 1:.2f} {y - 3:.2f} {cover_width:.2f} {font_size + 6:.2f} re f")
 
-        # Draw replacement text
-        pdf.set_font("Helvetica", "", font_size)
-        pdf.set_text_color(0, 0, 0)
-        pdf.text(x_pt, y_pt + font_size * 0.75, safe_text)
+        # Replacement text at the original position
+        ops.append("0 0 0 rg")  # black text
+        ops.append("BT")
+        ops.append(f"/F1 {font_size:.2f} Tf")
+        ops.append(f"{x:.2f} {y:.2f} Td")
+        ops.append(f"({escaped}) Tj")
+        ops.append("ET")
 
-    return pdf.output()
+    content_stream = "\n".join(ops)
+
+    # Build a minimal single-page PDF with Helvetica font
+    from pypdf import PdfReader as _PdfReader
+    from fpdf import FPDF
+
+    # Use fpdf to create a minimal PDF with a Helvetica font resource,
+    # then we'll replace the content stream.
+    pdf = FPDF(orientation="P", unit="pt", format=(page_width, page_height))
+    pdf.add_page()
+    pdf.set_auto_page_break(auto=False)
+    pdf.set_font("Helvetica", "", 8)
+    pdf.text(0, 0, " ")  # force font resource to be created
+    overlay_bytes = pdf.output()
+
+    # Parse the overlay and replace content stream
+    overlay_reader = _PdfReader(io.BytesIO(overlay_bytes))
+    from pypdf import PdfWriter
+    overlay_writer = PdfWriter()
+    overlay_writer.add_page(overlay_reader.pages[0])
+    page = overlay_writer.pages[0]
+
+    # Replace content stream with our raw operations
+    from pypdf.generic import ArrayObject, DecodedStreamObject, NameObject
+    new_stream = DecodedStreamObject()
+    new_stream.set_data(content_stream.encode("latin-1"))
+    page[NameObject("/Contents")] = overlay_writer._add_object(new_stream)
+
+    buf = io.BytesIO()
+    overlay_writer.write(buf)
+    return buf.getvalue()
 
 
 def anonymize_1042s_pdf(input_path: str, output_path: str,
@@ -1061,6 +1113,59 @@ def anonymize_1042s_pdf(input_path: str, output_path: str,
 
     with open(output_path, "wb") as f:
         writer.write(f)
+
+
+def debug_pdf_extraction(input_path: str, config: AnonConfig | None = None) -> str:
+    """Diagnostic: show what text extraction finds in a PDF.
+
+    Returns a human-readable report of all extracted fragments, planned
+    replacements, and coordinate details. Useful for debugging why overlay
+    anonymization isn't working on a specific PDF.
+    """
+    from pypdf import PdfReader
+
+    config = config or AnonConfig()
+    rng = _make_rng(config.seed)
+    reader = PdfReader(input_path)
+
+    price_factor = rng.uniform(*config.price_shift_range)
+    date_shift = timedelta(days=rng.randint(*config.date_shift_days))
+
+    fragments = _extract_text_with_positions(reader)
+    replacement_map = _build_replacement_map(fragments, rng, price_factor, date_shift)
+
+    lines: list[str] = []
+    lines.append(f"PDF: {input_path}")
+    lines.append(f"Pages: {len(reader.pages)}")
+    lines.append(f"Total fragments extracted: {len(fragments)}")
+    lines.append("")
+
+    for page_idx, page in enumerate(reader.pages):
+        mediabox = page.mediabox
+        lines.append(f"--- Page {page_idx} ---")
+        lines.append(f"  MediaBox: {mediabox}")
+        lines.append(f"  Size: {float(mediabox.width):.1f} x {float(mediabox.height):.1f} pt")
+
+        page_frags = [f for f in fragments if f.page_idx == page_idx]
+        lines.append(f"  Fragments: {len(page_frags)}")
+
+        for i, frag in enumerate(page_frags):
+            lines.append(
+                f"  [{i:3d}] ({frag.x:7.1f}, {frag.y:7.1f}) "
+                f"size={frag.font_size:5.1f}  "
+                f"{frag.text!r}"
+            )
+
+        page_replacements = replacement_map.get(page_idx, [])
+        lines.append(f"  Replacements planned: {len(page_replacements)}")
+        for frag, new_text in page_replacements:
+            lines.append(
+                f"    ({frag.x:7.1f}, {frag.y:7.1f}) "
+                f"{frag.text!r} -> {new_text!r}"
+            )
+        lines.append("")
+
+    return "\n".join(lines)
 
 
 # ── File type detection & unified entry point ─────────────────────────────

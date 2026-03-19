@@ -35,7 +35,7 @@ def _anonymize(args: list[str]) -> None:
     import argparse
     import os
 
-    from .anonymize import AnonConfig, anonymize_file
+    from .anonymize import AnonConfig, anonymize_file, debug_pdf_extraction
 
     parser = argparse.ArgumentParser(
         prog="rsu-tax anonymize",
@@ -55,11 +55,22 @@ def _anonymize(args: list[str]) -> None:
         default=None,
         help="Random seed for reproducible output",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Show diagnostic info about PDF text extraction (no output file created)",
+    )
     opts = parser.parse_args(args)
 
     if not os.path.isfile(opts.file):
         print(f"Error: file not found: {opts.file}", file=sys.stderr)
         sys.exit(1)
+
+    config = AnonConfig(seed=opts.seed)
+
+    if opts.debug:
+        print(debug_pdf_extraction(opts.file, config))
+        return
 
     if opts.output:
         output_path = opts.output
@@ -67,7 +78,6 @@ def _anonymize(args: list[str]) -> None:
         base, ext = os.path.splitext(opts.file)
         output_path = f"{base}-anonymized{ext}"
 
-    config = AnonConfig(seed=opts.seed)
     file_type = anonymize_file(opts.file, output_path, config)
     type_label = {
         "realized_gains": "Realized Gain/Loss CSV",
