@@ -708,24 +708,7 @@ def anonymize_vesting_csv(csv_text: str, config: AnonConfig | None = None) -> st
 
 # ── 1042-S PDF anonymization ──────────────────────────────────────────────
 
-# Patterns that identify sensitive text in a 1042-S PDF
-_SENSITIVE_PATTERNS: list[tuple[str, str]] = [
-    # (pattern_name, regex) — order matters for replacement priority
-    ("dollar_amount", r"\$[\d,]+\.\d{2}"),
-    ("bare_amount", r"(?<!\d)[\d,]{2,}\.\d{2}(?!\d)"),  # e.g. "323.00" without $
-    ("percentage", r"\d{1,3}\.\d{2}%"),
-    ("tin", r"\d{2}-\d{7}"),          # EIN: XX-XXXXXXX
-    ("ssn", r"\d{3}-\d{2}-\d{4}"),    # SSN
-    ("date_us", r"\d{1,2}/\d{1,2}/\d{4}"),
-    ("date_iso", r"\d{4}-\d{2}-\d{2}"),
-    ("date_ymd_nodash", r"\d{8}"),    # YYYYMMDD in date of birth fields
-    ("account_num", r"\d{4}-\d{4}"),  # Account numbers like 4563-7571
-]
-
-# Words/phrases that indicate a text fragment contains a person's name or address.
-# We match by context: if a text fragment appears near "Recipient" labels in the form,
-# we'll catch it via position. For standalone detection, we look for multi-word
-# capitalized strings that aren't known form labels.
+# Words/phrases that are part of the form template (not personal data).
 _FORM_LABELS = frozenset({
     "form", "1042-s", "1042", "copy", "department", "treasury", "internal",
     "revenue", "service", "income", "code", "gross", "chapter", "exemption",
@@ -755,328 +738,309 @@ _FORM_LABELS = frozenset({
     "through", "under", "over", "between", "after", "before", "during",
 })
 
+_FAKE_NAMES = [
+    "JOHN DOE", "JANE SMITH", "MAX MUSTERMANN", "ERIKA MUSTER",
+    "ALEX JOHNSON", "MARIA GARCIA",
+]
+_FAKE_ADDRESSES = [
+    "123 EXAMPLE STRASSE", "456 MUSTER WEG", "789 DEMO ALLEE",
+    "42 SAMPLE ROAD", "10 TEST BOULEVARD",
+]
+_FAKE_CITIES = [
+    "10115 BERLIN, GERMANY", "80331 MUNICH, GERMANY",
+    "20095 HAMBURG, GERMANY", "50667 COLOGNE, GERMANY",
+]
 
-def _is_known_label(text: str) -> bool:
-    """Check if text is a standard form label rather than personal data."""
+
+def _parse_pdf_string(data: bytes, start: int) -> tuple[bytes, int]:
+    """Parse a PDF literal string starting at '(' at position `start`.
+
+    Returns (unescaped_content_bytes, position_after_closing_paren).
+    Handles escape sequences and nested parentheses per PDF spec.
+    """
+    i = start + 1
+    depth = 1
+    content = bytearray()
+
+    while i < len(data) and depth > 0:
+        b = data[i]
+        if b == ord(b"\\"):
+            if i + 1 >= len(data):
+                content.append(b)
+                i += 1
+                continue
+            nb = data[i + 1]
+            if nb == ord(b"n"):
+                content.append(ord(b"\n"))
+                i += 2
+            elif nb == ord(b"r"):
+                content.append(ord(b"\r"))
+                i += 2
+            elif nb == ord(b"t"):
+                content.append(ord(b"\t"))
+                i += 2
+            elif nb == ord(b"b"):
+                content.append(ord(b"\b"))
+                i += 2
+            elif nb == ord(b"f"):
+                content.append(ord(b"\f"))
+                i += 2
+            elif nb in (ord(b"("), ord(b")"), ord(b"\\")):
+                content.append(nb)
+                i += 2
+            elif ord(b"0") <= nb <= ord(b"7"):
+                octal = chr(nb)
+                j = i + 2
+                for _ in range(2):
+                    if j < len(data) and ord(b"0") <= data[j] <= ord(b"7"):
+                        octal += chr(data[j])
+                        j += 1
+                    else:
+                        break
+                content.append(int(octal, 8))
+                i = j
+            elif nb == ord(b"\n"):
+                i += 2  # line continuation
+            elif nb == ord(b"\r"):
+                i += 2
+                if i < len(data) and data[i] == ord(b"\n"):
+                    i += 1
+            else:
+                content.append(nb)
+                i += 2
+        elif b == ord(b"("):
+            depth += 1
+            content.append(b)
+            i += 1
+        elif b == ord(b")"):
+            depth -= 1
+            if depth > 0:
+                content.append(b)
+            i += 1
+        else:
+            content.append(b)
+            i += 1
+
+    return bytes(content), i
+
+
+def _escape_pdf_string(data: bytes) -> bytes:
+    """Escape bytes for a PDF literal string (content between parens)."""
+    result = bytearray()
+    for b in data:
+        if b == ord(b"("):
+            result.extend(b"\\(")
+        elif b == ord(b")"):
+            result.extend(b"\\)")
+        elif b == ord(b"\\"):
+            result.extend(b"\\\\")
+        elif b < 32 or b > 126:
+            result.extend(f"\\{b:03o}".encode("ascii"))
+        else:
+            result.append(b)
+    return bytes(result)
+
+
+def _is_name_candidate(text: str) -> bool:
+    """Check if a decoded text string looks like a personal name or address."""
+    text = text.strip()
+    # Too short or too long
+    if len(text) < 4 or len(text) > 60:
+        return False
+    # Must be mostly alphabetic
+    alpha_ratio = sum(1 for c in text if c.isalpha()) / max(len(text), 1)
+    if alpha_ratio < 0.6:
+        return False
+    # Skip if it contains dollar amounts or number patterns
+    if re.search(r"\$[\d,]+\.\d{2}|\d{2,}-\d{2,}", text):
+        return False
+    # Check against known form labels
     words = text.lower().split()
-    return all(w.rstrip(".,;:()") in _FORM_LABELS or len(w) <= 2 for w in words)
+    if not words:
+        return False
+    label_count = sum(1 for w in words if w.rstrip(".,;:()") in _FORM_LABELS)
+    # If all words are form labels, skip
+    if label_count == len(words):
+        return False
+    # If most words (>50%) are common form/English words, it's prose, skip
+    if len(words) > 3 and label_count / len(words) > 0.5:
+        return False
+    # Single common word — not a name
+    if len(words) == 1 and words[0].rstrip(".,;:()").lower() in _FORM_LABELS:
+        return False
+    return True
 
 
-@dataclass
-class _TextFragment:
-    """A piece of text extracted from a PDF page with its position and font size."""
-    text: str
-    x: float
-    y: float
-    font_size: float
-    page_idx: int
+def _replace_name(text: str, rng: "random.Random") -> str:
+    """Replace a name/address candidate with a fake one."""
+    if any(kw in text.lower() for kw in ("street", "str", "weg", "allee",
+                                          "road", "way", "ave", "blvd",
+                                          "platz", "gasse")):
+        return rng.choice(_FAKE_ADDRESSES)
+    if re.search(r"\d{4,5}\s", text):
+        return rng.choice(_FAKE_CITIES)
+    return rng.choice(_FAKE_NAMES)
 
 
-def _mult_matrix(a: list[float], b: list[float]) -> list[float]:
-    """Multiply two PDF transformation matrices (6-element arrays).
-
-    PDF matrices are stored as [a, b, c, d, e, f] representing:
-        | a  b  0 |
-        | c  d  0 |
-        | e  f  1 |
-    """
-    return [
-        a[0] * b[0] + a[1] * b[2],
-        a[0] * b[1] + a[1] * b[3],
-        a[2] * b[0] + a[3] * b[2],
-        a[2] * b[1] + a[3] * b[3],
-        a[4] * b[0] + a[5] * b[2] + b[4],
-        a[4] * b[1] + a[5] * b[3] + b[5],
-    ]
-
-
-def _extract_text_with_positions(reader: "PdfReader") -> list[_TextFragment]:
-    """Extract all text fragments from a PDF with their positions.
-
-    Uses the full transformation (tm * cm) for accurate coordinates in
-    complex PDFs that use non-identity current transformation matrices.
-    """
-    fragments: list[_TextFragment] = []
-
-    for page_idx, page in enumerate(reader.pages):
-        def visitor(text: str, cm: list, tm: list, font_dict: dict, font_size: float,
-                    _page_idx: int = page_idx) -> None:
-            if text.strip():
-                # Combine text matrix with current transformation matrix
-                # for accurate coordinates in complex PDFs.
-                final = _mult_matrix(tm, cm)
-                # Effective font size accounts for scaling in the matrices.
-                scale_y = abs(final[3]) if final[3] != 0 else abs(final[1])
-                effective_size = font_size * scale_y if scale_y and font_size else (font_size or 8.0)
-                # If effective size is unreasonably small or large, fall back
-                if effective_size < 1 or effective_size > 100:
-                    effective_size = font_size if font_size and font_size > 0 else 8.0
-                fragments.append(_TextFragment(
-                    text=text.strip(),
-                    x=final[4],
-                    y=final[5],
-                    font_size=effective_size,
-                    page_idx=_page_idx,
-                ))
-        page.extract_text(visitor_text=visitor)
-
-    return fragments
-
-
-def _build_replacement_map(
-    fragments: list[_TextFragment],
-    rng: random.Random,
+def _anonymize_pdf_string(
+    raw_bytes: bytes,
+    rng: "random.Random",
     price_factor: float,
     date_shift: timedelta,
-) -> dict[int, list[tuple[_TextFragment, str]]]:
-    """Build a per-page mapping of (original_fragment, replacement_text).
-
-    Returns {page_idx: [(fragment, new_text), ...]}.
-    """
-    replacements: dict[int, list[tuple[_TextFragment, str]]] = {}
-
-    # First pass: collect all dollar amounts to understand the value distribution
-    all_amounts: list[tuple[_TextFragment, float]] = []
-    for frag in fragments:
-        for m in re.finditer(r"\$?([\d,]+\.\d{2})", frag.text):
-            try:
-                val = float(m.group(1).replace(",", ""))
-                if val > 0:
-                    all_amounts.append((frag, val))
-            except ValueError:
-                pass
-
-    # Second pass: detect name/address fragments.
-    # In 1042-S forms, names and addresses appear as standalone text fragments
-    # near labeled fields.  We detect them by checking if a fragment:
-    #   - Is NOT a known form label
-    #   - Contains mostly alphabetic/space characters (not numbers/symbols)
-    #   - Is reasonably long (names/addresses are usually >4 chars)
-    _FAKE_NAMES = [
-        "JOHN DOE", "JANE SMITH", "MAX MUSTERMANN", "ERIKA MUSTER",
-        "ALEX JOHNSON", "MARIA GARCIA",
-    ]
-    _FAKE_ADDRESSES = [
-        "123 EXAMPLE STRASSE", "456 MUSTER WEG", "789 DEMO ALLEE",
-        "42 SAMPLE ROAD", "10 TEST BOULEVARD",
-    ]
-    _FAKE_CITIES = [
-        "10115 BERLIN, GERMANY", "80331 MUNICH, GERMANY",
-        "20095 HAMBURG, GERMANY", "50667 COLOGNE, GERMANY",
-    ]
-
-    # Track which fragments look like personal names or addresses.
-    # We're conservative: only flag fragments that look like proper nouns
-    # (names), street addresses, or city/postal lines — NOT general prose.
-    name_address_candidates: set[int] = set()
-    for i, frag in enumerate(fragments):
-        text = frag.text.strip()
-        # Skip very short or very long fragments (prose paragraphs)
-        if len(text) < 4 or len(text) > 80:
-            continue
-        # Skip fragments that contain dollar amounts, percentages, or TINs —
-        # those are handled by pattern-based replacement, not name heuristics
-        if re.search(r"\$[\d,]+\.\d{2}|\d{2,}-\d{2,}", text):
-            continue
-        # Skip fragments that are mostly numbers / form field labels
-        alpha_ratio = sum(1 for c in text if c.isalpha()) / max(len(text), 1)
-        if alpha_ratio < 0.5:
-            continue
-        # Skip known form labels
-        if _is_known_label(text):
-            continue
-        # Skip fragments that look like prose (many common English words)
-        words = text.lower().split()
-        common_word_count = sum(1 for w in words if w.rstrip(".,;:()") in _FORM_LABELS)
-        if len(words) > 3 and common_word_count / len(words) > 0.5:
-            continue
-        # If it looks like a person's name or address, flag it
-        name_address_candidates.add(i)
-
-    for i, frag in enumerate(fragments):
-        new_text = frag.text
-
-        # Replace personal names and addresses (only for non-numeric fragments)
-        if i in name_address_candidates:
-            text = frag.text.strip()
-
-            # Handle "Label: Value" patterns — preserve the label, replace the value
-            label_match = re.match(r"^((?:Recipient|Name|Address|Agent)\s*:\s*)", text, re.IGNORECASE)
-            prefix = label_match.group(1) if label_match else ""
-            value_part = text[len(prefix):].strip() if prefix else text
-
-            if any(kw in value_part.lower() for kw in ("street", "str", "weg", "allee",
-                                                        "road", "way", "ave", "blvd",
-                                                        "platz")):
-                replacement = rng.choice(_FAKE_ADDRESSES)
-            elif re.search(r"\d{4,5}\s", value_part):
-                replacement = rng.choice(_FAKE_CITIES)
-            else:
-                replacement = rng.choice(_FAKE_NAMES)
-
-            new_text = prefix + replacement if prefix else replacement
-
-        # Replace dollar amounts: $X,XXX.XX
-        def _replace_dollar(m: re.Match) -> str:
-            try:
-                val = float(m.group(0).replace("$", "").replace(",", ""))
-                new_val = round(val * price_factor, 2)
-                if "$" in m.group(0):
-                    return f"${new_val:,.2f}"
-                return f"{new_val:,.2f}"
-            except ValueError:
-                return m.group(0)
-
-        new_text = re.sub(r"\$[\d,]+\.\d{2}", _replace_dollar, new_text)
-
-        # Replace bare decimal amounts (e.g., "323.00" in form fields)
-        def _replace_bare_amount(m: re.Match) -> str:
-            try:
-                val = float(m.group(0).replace(",", ""))
-                # Don't replace small integers that might be codes (like "06", "15", "01")
-                # but do replace amounts that look like money
-                if val >= 10.0:
-                    new_val = round(val * price_factor, 2)
-                    return f"{new_val:,.2f}"
-                return m.group(0)
-            except ValueError:
-                return m.group(0)
-
-        new_text = re.sub(r"(?<!\d)[\d,]{2,}\.\d{2}(?!\d|%)", _replace_bare_amount, new_text)
-
-        # Replace EIN: XX-XXXXXXX
-        new_text = re.sub(r"\d{2}-\d{7}", f"{rng.randint(10,99)}-{rng.randint(1000000,9999999)}", new_text)
-
-        # Replace SSN: XXX-XX-XXXX
-        new_text = re.sub(r"\d{3}-\d{2}-\d{4}",
-                          f"{rng.randint(100,999)}-{rng.randint(10,99)}-{rng.randint(1000,9999)}", new_text)
-
-        # Replace account numbers: XXXX-XXXX
-        new_text = re.sub(r"\b\d{4}-\d{4}\b",
-                          f"{rng.randint(1000,9999)}-{rng.randint(1000,9999)}", new_text)
-
-        # Replace US dates: MM/DD/YYYY
-        def _replace_us_date(m: re.Match) -> str:
-            dt = _parse_date(m.group(0))
-            if dt:
-                return _format_date(dt + date_shift, m.group(0))
-            return m.group(0)
-
-        new_text = re.sub(r"\d{1,2}/\d{1,2}/\d{4}", _replace_us_date, new_text)
-
-        # Replace ISO dates: YYYY-MM-DD
-        def _replace_iso_date(m: re.Match) -> str:
-            dt = _parse_date(m.group(0))
-            if dt:
-                return _format_date(dt + date_shift, m.group(0))
-            return m.group(0)
-
-        new_text = re.sub(r"\d{4}-\d{2}-\d{2}", _replace_iso_date, new_text)
-
-        # Replace 8-digit date-like sequences (YYYYMMDD) in date of birth fields
-        def _replace_compact_date(m: re.Match) -> str:
-            s = m.group(0)
-            try:
-                dt = datetime.strptime(s, "%Y%m%d")
-                new_dt = dt + date_shift
-                return new_dt.strftime("%Y%m%d")
-            except ValueError:
-                return s
-
-        new_text = re.sub(r"\b[12]\d{3}[01]\d[0-3]\d\b", _replace_compact_date, new_text)
-
-        # Only record if something changed
-        if new_text != frag.text:
-            replacements.setdefault(frag.page_idx, []).append((frag, new_text))
-
-    return replacements
-
-
-def _create_overlay_page(
-    page_width: float,
-    page_height: float,
-    replacements: list[tuple[_TextFragment, str]],
+    replace_names: bool,
 ) -> bytes:
-    """Create a single-page PDF overlay with white boxes + replacement text.
+    """Apply anonymization to a single decoded PDF text string.
 
-    Uses raw PDF content stream for precise coordinate control instead of
-    fpdf's top-left coordinate system, avoiding y-coordinate conversion bugs.
+    Returns the (possibly modified) bytes.  If nothing matched, returns
+    the original bytes unchanged.
     """
-    # Build a raw PDF content stream directly in PDF coordinate space
-    # (origin at bottom-left, same as pypdf's extracted coordinates).
-    # This avoids all the fpdf coordinate transformation issues.
-    ops: list[str] = []
+    try:
+        text = raw_bytes.decode("latin-1")
+    except Exception:
+        return raw_bytes
 
-    for frag, new_text in replacements:
-        font_size = frag.font_size if frag.font_size > 0 else 8.0
+    if not text.strip():
+        return raw_bytes
 
-        # Sanitize text for PDF string (latin-1, escape parens and backslash)
-        safe_text = new_text.encode("latin-1", errors="replace").decode("latin-1")
-        escaped = safe_text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+    original = text
 
-        # Estimate text width
-        orig_width = len(frag.text) * font_size * 0.55
-        new_width = len(safe_text) * font_size * 0.55
-        cover_width = max(orig_width, new_width) + 4
+    # ── Pattern-based replacements (always applied) ───────────────────
 
-        x = frag.x
-        y = frag.y
+    # Dollar amounts: $X,XXX.XX
+    def _repl_dollar(m: re.Match[str]) -> str:
+        try:
+            val = float(m.group(0).replace("$", "").replace(",", ""))
+            nv = round(val * price_factor, 2)
+            return f"${nv:,.2f}" if "$" in m.group(0) else f"{nv:,.2f}"
+        except ValueError:
+            return m.group(0)
 
-        # White rectangle to cover original text
-        # rect_y places the rectangle slightly below the baseline
-        ops.append("1 1 1 rg")  # white fill
-        ops.append(f"{x - 1:.2f} {y - 3:.2f} {cover_width:.2f} {font_size + 6:.2f} re f")
+    text = re.sub(r"\$[\d,]+\.\d{2}", _repl_dollar, text)
 
-        # Replacement text at the original position
-        ops.append("0 0 0 rg")  # black text
-        ops.append("BT")
-        ops.append(f"/F1 {font_size:.2f} Tf")
-        ops.append(f"{x:.2f} {y:.2f} Td")
-        ops.append(f"({escaped}) Tj")
-        ops.append("ET")
+    # Bare amounts without $ (e.g. "323.00")
+    def _repl_bare(m: re.Match[str]) -> str:
+        try:
+            val = float(m.group(0).replace(",", ""))
+            if val < 10.0:
+                return m.group(0)  # skip small numbers that might be codes
+            nv = round(val * price_factor, 2)
+            return f"{nv:,.2f}"
+        except ValueError:
+            return m.group(0)
 
-    content_stream = "\n".join(ops)
+    text = re.sub(r"(?<!\d)[\d,]{2,}\.\d{2}(?!\d|%)", _repl_bare, text)
 
-    # Build a minimal single-page PDF with Helvetica font
-    from pypdf import PdfReader as _PdfReader
-    from fpdf import FPDF
+    # EIN: XX-XXXXXXX
+    text = re.sub(
+        r"\d{2}-\d{7}",
+        lambda m: f"{rng.randint(10, 99)}-{rng.randint(1000000, 9999999)}",
+        text,
+    )
 
-    # Use fpdf to create a minimal PDF with a Helvetica font resource,
-    # then we'll replace the content stream.
-    pdf = FPDF(orientation="P", unit="pt", format=(page_width, page_height))
-    pdf.add_page()
-    pdf.set_auto_page_break(auto=False)
-    pdf.set_font("Helvetica", "", 8)
-    pdf.text(0, 0, " ")  # force font resource to be created
-    overlay_bytes = pdf.output()
+    # SSN: XXX-XX-XXXX
+    text = re.sub(
+        r"\d{3}-\d{2}-\d{4}",
+        lambda m: f"{rng.randint(100, 999)}-{rng.randint(10, 99)}-{rng.randint(1000, 9999)}",
+        text,
+    )
 
-    # Parse the overlay and replace content stream
-    overlay_reader = _PdfReader(io.BytesIO(overlay_bytes))
-    from pypdf import PdfWriter
-    overlay_writer = PdfWriter()
-    overlay_writer.add_page(overlay_reader.pages[0])
-    page = overlay_writer.pages[0]
+    # Account numbers: XXXX-XXXX
+    text = re.sub(
+        r"\b\d{4}-\d{4}\b",
+        lambda m: f"{rng.randint(1000, 9999)}-{rng.randint(1000, 9999)}",
+        text,
+    )
 
-    # Replace content stream with our raw operations
-    from pypdf.generic import ArrayObject, DecodedStreamObject, NameObject
-    new_stream = DecodedStreamObject()
-    new_stream.set_data(content_stream.encode("latin-1"))
-    page[NameObject("/Contents")] = overlay_writer._add_object(new_stream)
+    # US dates: MM/DD/YYYY
+    def _repl_us_date(m: re.Match[str]) -> str:
+        dt = _parse_date(m.group(0))
+        return _format_date(dt + date_shift, m.group(0)) if dt else m.group(0)
 
-    buf = io.BytesIO()
-    overlay_writer.write(buf)
-    return buf.getvalue()
+    text = re.sub(r"\d{1,2}/\d{1,2}/\d{4}", _repl_us_date, text)
+
+    # ISO dates: YYYY-MM-DD
+    def _repl_iso_date(m: re.Match[str]) -> str:
+        dt = _parse_date(m.group(0))
+        return _format_date(dt + date_shift, m.group(0)) if dt else m.group(0)
+
+    text = re.sub(r"\d{4}-\d{2}-\d{2}", _repl_iso_date, text)
+
+    # Compact dates: YYYYMMDD (date of birth fields)
+    def _repl_compact_date(m: re.Match[str]) -> str:
+        try:
+            dt = datetime.strptime(m.group(0), "%Y%m%d")
+            return (dt + date_shift).strftime("%Y%m%d")
+        except ValueError:
+            return m.group(0)
+
+    text = re.sub(r"\b[12]\d{3}[01]\d[0-3]\d\b", _repl_compact_date, text)
+
+    # ── Name/address replacement (form pages only) ────────────────────
+    if replace_names and text == original:
+        # Only consider name replacement if no pattern-based change was made
+        # (avoids double-processing strings that contain amounts AND names)
+        if _is_name_candidate(text):
+            text = _replace_name(text, rng)
+
+    if text != original:
+        return text.encode("latin-1", errors="replace")
+    return raw_bytes
 
 
-def anonymize_1042s_pdf(input_path: str, output_path: str,
-                        config: AnonConfig | None = None) -> None:
-    """Anonymize a 1042-S PDF by overlaying replacements on the original.
+def _process_content_stream(
+    data: bytes,
+    rng: "random.Random",
+    price_factor: float,
+    date_shift: timedelta,
+    replace_names: bool,
+) -> bytes:
+    """Walk a raw PDF content stream, find all literal strings, and apply
+    anonymization replacements in-place.  Returns modified stream bytes.
+    """
+    result = bytearray()
+    i = 0
 
-    Preserves the original layout, pages, and form structure. Only sensitive
-    data (amounts, names, TINs, addresses, dates) is covered with white
-    rectangles and replaced with anonymized values.
+    while i < len(data):
+        if data[i : i + 1] == b"(":
+            # Parse the PDF literal string
+            string_bytes, end_pos = _parse_pdf_string(data, i)
+
+            # Apply anonymization
+            new_bytes = _anonymize_pdf_string(
+                string_bytes, rng, price_factor, date_shift, replace_names,
+            )
+
+            # Re-encode into the stream
+            result.extend(b"(")
+            result.extend(_escape_pdf_string(new_bytes))
+            result.extend(b")")
+            i = end_pos
+        elif data[i : i + 1] == b"<" and i + 1 < len(data) and data[i + 1 : i + 2] != b"<":
+            # Hex string <...> — leave as-is
+            end = data.find(b">", i)
+            if end == -1:
+                result.extend(data[i:])
+                break
+            result.extend(data[i : end + 1])
+            i = end + 1
+        else:
+            result.append(data[i])
+            i += 1
+
+    return bytes(result)
+
+
+def anonymize_1042s_pdf(
+    input_path: str, output_path: str, config: AnonConfig | None = None,
+) -> None:
+    """Anonymize a 1042-S PDF by modifying text in the content streams.
+
+    Instead of overlaying, this directly replaces sensitive text (amounts,
+    TINs, dates, names) inside each page's content stream operators.
+    The text stays at exactly the same position with the same font.
     """
     from pypdf import PdfReader, PdfWriter
+    from pypdf.generic import ArrayObject, DecodedStreamObject, NameObject
 
     config = config or AnonConfig()
     rng = _make_rng(config.seed)
@@ -1085,44 +1049,59 @@ def anonymize_1042s_pdf(input_path: str, output_path: str,
     price_factor = rng.uniform(*config.price_shift_range)
     date_shift = timedelta(days=rng.randint(*config.date_shift_days))
 
-    # Extract text with positions
-    fragments = _extract_text_with_positions(reader)
-
-    # Build replacement map
-    replacement_map = _build_replacement_map(fragments, rng, price_factor, date_shift)
-
-    # Create output PDF — clone from original to preserve structure
     writer = PdfWriter(clone_from=reader)
 
     for page_idx in range(len(writer.pages)):
-        if page_idx in replacement_map and replacement_map[page_idx]:
-            page = writer.pages[page_idx]
-            mediabox = page.mediabox
-            page_width = float(mediabox.width)
-            page_height = float(mediabox.height)
+        page = writer.pages[page_idx]
 
-            # Create overlay
-            overlay_bytes = _create_overlay_page(
-                page_width, page_height,
-                replacement_map[page_idx],
+        # Detect instruction pages by text density — skip name replacement
+        # on pages with lots of text (instructions, explanations).
+        page_text = reader.pages[page_idx].extract_text() or ""
+        is_form_page = len(page_text) < 3000
+        replace_names = is_form_page
+
+        # Get the raw content stream data
+        contents_ref = page.get("/Contents")
+        if contents_ref is None:
+            continue
+
+        contents_obj = contents_ref.get_object()
+
+        if isinstance(contents_obj, ArrayObject):
+            # Multiple content streams — process each one
+            for idx, item_ref in enumerate(contents_obj):
+                stream_obj = item_ref.get_object()
+                raw = stream_obj.get_data()
+                modified = _process_content_stream(
+                    raw, rng, price_factor, date_shift, replace_names,
+                )
+                if modified != raw:
+                    new_stream = DecodedStreamObject()
+                    new_stream.set_data(modified)
+                    contents_obj[idx] = writer._add_object(new_stream)
+        else:
+            # Single content stream
+            raw = contents_obj.get_data()
+            modified = _process_content_stream(
+                raw, rng, price_factor, date_shift, replace_names,
             )
-
-            # Merge overlay onto the page (already attached to writer)
-            overlay_reader = PdfReader(io.BytesIO(overlay_bytes))
-            page.merge_page(overlay_reader.pages[0])
+            if modified != raw:
+                new_stream = DecodedStreamObject()
+                new_stream.set_data(modified)
+                page[NameObject("/Contents")] = writer._add_object(new_stream)
 
     with open(output_path, "wb") as f:
         writer.write(f)
 
 
 def debug_pdf_extraction(input_path: str, config: AnonConfig | None = None) -> str:
-    """Diagnostic: show what text extraction finds in a PDF.
+    """Diagnostic: show content stream text strings and planned replacements.
 
-    Returns a human-readable report of all extracted fragments, planned
-    replacements, and coordinate details. Useful for debugging why overlay
-    anonymization isn't working on a specific PDF.
+    Returns a human-readable report. Useful for debugging anonymization
+    on a specific PDF.
     """
     from pypdf import PdfReader
+    from pypdf.generic import ArrayObject
 
     config = config or AnonConfig()
     rng = _make_rng(config.seed)
@@ -1131,38 +1110,71 @@ def debug_pdf_extraction(input_path: str, config: AnonConfig | None = None) -> s
     price_factor = rng.uniform(*config.price_shift_range)
     date_shift = timedelta(days=rng.randint(*config.date_shift_days))
 
-    fragments = _extract_text_with_positions(reader)
-    replacement_map = _build_replacement_map(fragments, rng, price_factor, date_shift)
-
     lines: list[str] = []
     lines.append(f"PDF: {input_path}")
     lines.append(f"Pages: {len(reader.pages)}")
-    lines.append(f"Total fragments extracted: {len(fragments)}")
     lines.append("")
 
     for page_idx, page in enumerate(reader.pages):
         mediabox = page.mediabox
+        page_text = page.extract_text() or ""
+        is_form_page = len(page_text) < 3000
+
         lines.append(f"--- Page {page_idx} ---")
         lines.append(f"  MediaBox: {mediabox}")
-        lines.append(f"  Size: {float(mediabox.width):.1f} x {float(mediabox.height):.1f} pt")
+        lines.append(f"  Text length: {len(page_text)} chars")
+        lines.append(f"  Type: {'form' if is_form_page else 'instruction (name replacement skipped)'}")
 
-        page_frags = [f for f in fragments if f.page_idx == page_idx]
-        lines.append(f"  Fragments: {len(page_frags)}")
+        # Extract all literal strings from content stream
+        contents_ref = page.get("/Contents")
+        if contents_ref is None:
+            lines.append("  No content stream")
+            continue
 
-        for i, frag in enumerate(page_frags):
-            lines.append(
-                f"  [{i:3d}] ({frag.x:7.1f}, {frag.y:7.1f}) "
-                f"size={frag.font_size:5.1f}  "
-                f"{frag.text!r}"
-            )
+        contents_obj = contents_ref.get_object()
+        if isinstance(contents_obj, ArrayObject):
+            raw_parts = [item.get_object().get_data() for item in contents_obj]
+            raw = b"\n".join(raw_parts)
+        else:
+            raw = contents_obj.get_data()
 
-        page_replacements = replacement_map.get(page_idx, [])
-        lines.append(f"  Replacements planned: {len(page_replacements)}")
-        for frag, new_text in page_replacements:
-            lines.append(
-                f"    ({frag.x:7.1f}, {frag.y:7.1f}) "
-                f"{frag.text!r} -> {new_text!r}"
-            )
+        # Find all literal strings
+        string_count = 0
+        replacement_count = 0
+        i = 0
+        while i < len(raw):
+            if raw[i : i + 1] == b"(":
+                string_bytes, end_pos = _parse_pdf_string(raw, i)
+                try:
+                    text = string_bytes.decode("latin-1")
+                except Exception:
+                    text = repr(string_bytes)
+
+                if text.strip():
+                    # Check what replacement would be made
+                    test_rng = _make_rng(config.seed)
+                    # Advance rng to match
+                    test_rng.uniform(*config.price_shift_range)
+                    test_rng.randint(*config.date_shift_days)
+                    new_bytes = _anonymize_pdf_string(
+                        string_bytes, rng, price_factor, date_shift, is_form_page,
+                    )
+                    try:
+                        new_text = new_bytes.decode("latin-1")
+                    except Exception:
+                        new_text = repr(new_bytes)
+
+                    if new_text != text:
+                        lines.append(f"  [{string_count:3d}] {text!r}")
+                        lines.append(f"         -> {new_text!r}")
+                        replacement_count += 1
+                    string_count += 1
+
+                i = end_pos
+            else:
+                i += 1
+
+        lines.append(f"  Strings: {string_count}, Replacements: {replacement_count}")
         lines.append("")
 
     return "\n".join(lines)

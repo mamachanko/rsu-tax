@@ -296,8 +296,8 @@ class TestPdfAnonymize:
             anon = PdfReader(dst)
             assert len(anon.pages) == len(orig.pages) == 3
 
-    def test_overlay_contains_replacement_amounts(self):
-        """The overlay should contain new dollar amounts different from originals."""
+    def test_replaces_amounts(self):
+        """Dollar amounts should be replaced with different values."""
         from pypdf import PdfReader
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -309,13 +309,13 @@ class TestPdfAnonymize:
             reader = PdfReader(dst)
             text = "\n".join(page.extract_text() or "" for page in reader.pages)
 
-            # The overlay adds new amounts (pypdf shows both original + overlay)
+            # Original amounts should be gone
+            assert "$75,432.18" not in text
+            # But dollar amounts should still be present (replaced)
             amounts = re.findall(r"\$([\d,]+\.\d{2})", text)
-            parsed = sorted(set(float(a.replace(",", "")) for a in amounts))
-            # Should have more than just the originals — overlay added new values
-            assert len(parsed) > 2
+            assert len(amounts) >= 1
 
-    def test_overlay_replaces_tin(self):
+    def test_replaces_tin(self):
         """TIN (SSN format) should be replaced with a different number."""
         from pypdf import PdfReader
 
@@ -328,12 +328,12 @@ class TestPdfAnonymize:
             reader = PdfReader(dst)
             text = "\n".join(page.extract_text() or "" for page in reader.pages)
 
-            # The overlay should contain a different TIN
+            # Original TIN should be gone, replaced with a new one
+            assert "123-45-6789" not in text
             tins = re.findall(r"\d{3}-\d{2}-\d{4}", text)
-            assert len(tins) >= 2  # original + replacement
-            assert len(set(tins)) > 1  # they should differ
+            assert len(tins) >= 1
 
-    def test_overlay_replaces_ein(self):
+    def test_replaces_ein(self):
         """Withholding agent EIN should be replaced."""
         from pypdf import PdfReader
 
@@ -346,14 +346,14 @@ class TestPdfAnonymize:
             reader = PdfReader(dst)
             text = "\n".join(page.extract_text() or "" for page in reader.pages)
 
+            # Original EIN should be gone
+            assert "94-1737782" not in text
             eins = re.findall(r"\d{2}-\d{7}", text)
-            assert len(eins) >= 2  # original + replacement
-            assert len(set(eins)) > 1
+            assert len(eins) >= 1
 
-    def test_overlay_replaces_name(self):
-        """Recipient name should be overlaid with a fake name."""
+    def test_replaces_name(self):
+        """Recipient name should be replaced with a fake name."""
         from pypdf import PdfReader
-        from rsu_tax.anonymize import _FAKE_COMPANIES
 
         with tempfile.TemporaryDirectory() as tmpdir:
             src = os.path.join(tmpdir, "1042s.pdf")
@@ -364,7 +364,8 @@ class TestPdfAnonymize:
             reader = PdfReader(dst)
             text = "\n".join(page.extract_text() or "" for page in reader.pages)
 
-            # The overlay should contain a fake name (not the original)
+            # Original name should be gone, replaced with a fake
+            assert "Hans Mueller" not in text
             fake_names = ["JOHN DOE", "JANE SMITH", "MAX MUSTERMANN", "ERIKA MUSTER",
                           "ALEX JOHNSON", "MARIA GARCIA"]
             assert any(name in text for name in fake_names)
