@@ -708,99 +708,356 @@ def anonymize_vesting_csv(csv_text: str, config: AnonConfig | None = None) -> st
 
 # ── 1042-S PDF anonymization ──────────────────────────────────────────────
 
-def anonymize_1042s_pdf(input_path: str, output_path: str,
-                        config: AnonConfig | None = None) -> None:
-    """Anonymize a 1042-S PDF by extracting key data and generating a new PDF.
+# Patterns that identify sensitive text in a 1042-S PDF
+_SENSITIVE_PATTERNS: list[tuple[str, str]] = [
+    # (pattern_name, regex) — order matters for replacement priority
+    ("dollar_amount", r"\$[\d,]+\.\d{2}"),
+    ("bare_amount", r"(?<!\d)[\d,]{2,}\.\d{2}(?!\d)"),  # e.g. "323.00" without $
+    ("percentage", r"\d{1,3}\.\d{2}%"),
+    ("tin", r"\d{2}-\d{7}"),          # EIN: XX-XXXXXXX
+    ("ssn", r"\d{3}-\d{2}-\d{4}"),    # SSN
+    ("date_us", r"\d{1,2}/\d{1,2}/\d{4}"),
+    ("date_iso", r"\d{4}-\d{2}-\d{2}"),
+    ("date_ymd_nodash", r"\d{8}"),    # YYYYMMDD in date of birth fields
+    ("account_num", r"\d{4}-\d{4}"),  # Account numbers like 4563-7571
+]
 
-    Since editing PDFs in-place is unreliable, we:
-    1. Extract text from the original to identify monetary amounts and the tax year
-    2. Generate a clean new PDF with randomized values in the 1042-S structure
+# Words/phrases that indicate a text fragment contains a person's name or address.
+# We match by context: if a text fragment appears near "Recipient" labels in the form,
+# we'll catch it via position. For standalone detection, we look for multi-word
+# capitalized strings that aren't known form labels.
+_FORM_LABELS = frozenset({
+    "form", "1042-s", "1042", "copy", "department", "treasury", "internal",
+    "revenue", "service", "income", "code", "gross", "chapter", "exemption",
+    "withholding", "tax", "rate", "allowance", "federal", "withheld", "check",
+    "deposited", "irs", "escrow", "procedures", "applied", "instructions",
+    "occurred", "subsequent", "year", "respect", "partnership", "interest",
+    "qualified", "intermediary", "foreign", "trust", "revising", "reporting",
+    "report", "specific", "recipient", "agents", "overpaid", "repaid",
+    "pursuant", "adjustment", "total", "credit", "combine", "boxes", "paid",
+    "amounts", "not", "see", "agent", "primary", "pro-rata", "basis",
+    "intermediary's", "entity", "flow-through", "country", "identification",
+    "number", "global", "address", "street", "city", "town", "state",
+    "province", "zip", "postal", "payer", "name", "tin", "ein", "giin",
+    "status", "amended", "amendment", "unique", "form", "identifier",
+    "date", "birth", "applicable", "keep", "records", "omb", "no",
+    "go", "www", "irs", "gov", "for", "and", "the", "of", "to", "if",
+    "a", "an", "in", "on", "or", "by", "at", "is", "it", "was", "not",
+    "with", "from", "this", "that", "any", "are", "has", "had", "have",
+    "been", "its", "as", "may", "box", "source", "subject", "person",
+    "foreign", "information", "latest", "irs.gov/form1042s",
+    "provided", "report", "records", "amounts", "shown", "needed",
+    "complete", "return", "your", "copy", "instructions", "recipient",
+    "form", "1042-s", "keep", "filing", "should", "use", "you",
+    "will", "do", "can", "these", "those", "which", "other", "such",
+    "each", "all", "both", "also", "only", "about", "than", "more",
+    "some", "would", "could", "should", "shall", "must", "into",
+    "through", "under", "over", "between", "after", "before", "during",
+})
+
+
+def _is_known_label(text: str) -> bool:
+    """Check if text is a standard form label rather than personal data."""
+    words = text.lower().split()
+    return all(w.rstrip(".,;:()") in _FORM_LABELS or len(w) <= 2 for w in words)
+
+
+@dataclass
+class _TextFragment:
+    """A piece of text extracted from a PDF page with its position and font size."""
+    text: str
+    x: float
+    y: float
+    font_size: float
+    page_idx: int
+
+
+def _extract_text_with_positions(reader: "PdfReader") -> list[_TextFragment]:
+    """Extract all text fragments from a PDF with their positions."""
+    from pypdf import PdfReader as _  # just for type hint
+
+    fragments: list[_TextFragment] = []
+
+    for page_idx, page in enumerate(reader.pages):
+        def visitor(text: str, cm: list, tm: list, font_dict: dict, font_size: float,
+                    _page_idx: int = page_idx) -> None:
+            if text.strip():
+                fragments.append(_TextFragment(
+                    text=text.strip(),
+                    x=tm[4],
+                    y=tm[5],
+                    font_size=font_size or 8.0,
+                    page_idx=_page_idx,
+                ))
+        page.extract_text(visitor_text=visitor)
+
+    return fragments
+
+
+def _build_replacement_map(
+    fragments: list[_TextFragment],
+    rng: random.Random,
+    price_factor: float,
+    date_shift: timedelta,
+) -> dict[int, list[tuple[_TextFragment, str]]]:
+    """Build a per-page mapping of (original_fragment, replacement_text).
+
+    Returns {page_idx: [(fragment, new_text), ...]}.
+    """
+    replacements: dict[int, list[tuple[_TextFragment, str]]] = {}
+
+    # First pass: collect all dollar amounts to understand the value distribution
+    all_amounts: list[tuple[_TextFragment, float]] = []
+    for frag in fragments:
+        for m in re.finditer(r"\$?([\d,]+\.\d{2})", frag.text):
+            try:
+                val = float(m.group(1).replace(",", ""))
+                if val > 0:
+                    all_amounts.append((frag, val))
+            except ValueError:
+                pass
+
+    # Second pass: detect name/address fragments.
+    # In 1042-S forms, names and addresses appear as standalone text fragments
+    # near labeled fields.  We detect them by checking if a fragment:
+    #   - Is NOT a known form label
+    #   - Contains mostly alphabetic/space characters (not numbers/symbols)
+    #   - Is reasonably long (names/addresses are usually >4 chars)
+    _FAKE_NAMES = [
+        "JOHN DOE", "JANE SMITH", "MAX MUSTERMANN", "ERIKA MUSTER",
+        "ALEX JOHNSON", "MARIA GARCIA",
+    ]
+    _FAKE_ADDRESSES = [
+        "123 EXAMPLE STRASSE", "456 MUSTER WEG", "789 DEMO ALLEE",
+        "42 SAMPLE ROAD", "10 TEST BOULEVARD",
+    ]
+    _FAKE_CITIES = [
+        "10115 BERLIN, GERMANY", "80331 MUNICH, GERMANY",
+        "20095 HAMBURG, GERMANY", "50667 COLOGNE, GERMANY",
+    ]
+
+    # Track which fragments look like personal names or addresses.
+    # We're conservative: only flag fragments that look like proper nouns
+    # (names), street addresses, or city/postal lines — NOT general prose.
+    name_address_candidates: set[int] = set()
+    for i, frag in enumerate(fragments):
+        text = frag.text.strip()
+        # Skip very short or very long fragments (prose paragraphs)
+        if len(text) < 4 or len(text) > 80:
+            continue
+        # Skip fragments that contain dollar amounts, percentages, or TINs —
+        # those are handled by pattern-based replacement, not name heuristics
+        if re.search(r"\$[\d,]+\.\d{2}|\d{2,}-\d{2,}", text):
+            continue
+        # Skip fragments that are mostly numbers / form field labels
+        alpha_ratio = sum(1 for c in text if c.isalpha()) / max(len(text), 1)
+        if alpha_ratio < 0.5:
+            continue
+        # Skip known form labels
+        if _is_known_label(text):
+            continue
+        # Skip fragments that look like prose (many common English words)
+        words = text.lower().split()
+        common_word_count = sum(1 for w in words if w.rstrip(".,;:()") in _FORM_LABELS)
+        if len(words) > 3 and common_word_count / len(words) > 0.5:
+            continue
+        # If it looks like a person's name or address, flag it
+        name_address_candidates.add(i)
+
+    for i, frag in enumerate(fragments):
+        new_text = frag.text
+
+        # Replace personal names and addresses (only for non-numeric fragments)
+        if i in name_address_candidates:
+            text = frag.text.strip()
+
+            # Handle "Label: Value" patterns — preserve the label, replace the value
+            label_match = re.match(r"^((?:Recipient|Name|Address|Agent)\s*:\s*)", text, re.IGNORECASE)
+            prefix = label_match.group(1) if label_match else ""
+            value_part = text[len(prefix):].strip() if prefix else text
+
+            if any(kw in value_part.lower() for kw in ("street", "str", "weg", "allee",
+                                                        "road", "way", "ave", "blvd",
+                                                        "platz")):
+                replacement = rng.choice(_FAKE_ADDRESSES)
+            elif re.search(r"\d{4,5}\s", value_part):
+                replacement = rng.choice(_FAKE_CITIES)
+            else:
+                replacement = rng.choice(_FAKE_NAMES)
+
+            new_text = prefix + replacement if prefix else replacement
+
+        # Replace dollar amounts: $X,XXX.XX
+        def _replace_dollar(m: re.Match) -> str:
+            try:
+                val = float(m.group(0).replace("$", "").replace(",", ""))
+                new_val = round(val * price_factor, 2)
+                if "$" in m.group(0):
+                    return f"${new_val:,.2f}"
+                return f"{new_val:,.2f}"
+            except ValueError:
+                return m.group(0)
+
+        new_text = re.sub(r"\$[\d,]+\.\d{2}", _replace_dollar, new_text)
+
+        # Replace bare decimal amounts (e.g., "323.00" in form fields)
+        def _replace_bare_amount(m: re.Match) -> str:
+            try:
+                val = float(m.group(0).replace(",", ""))
+                # Don't replace small integers that might be codes (like "06", "15", "01")
+                # but do replace amounts that look like money
+                if val >= 10.0:
+                    new_val = round(val * price_factor, 2)
+                    return f"{new_val:,.2f}"
+                return m.group(0)
+            except ValueError:
+                return m.group(0)
+
+        new_text = re.sub(r"(?<!\d)[\d,]{2,}\.\d{2}(?!\d|%)", _replace_bare_amount, new_text)
+
+        # Replace EIN: XX-XXXXXXX
+        new_text = re.sub(r"\d{2}-\d{7}", f"{rng.randint(10,99)}-{rng.randint(1000000,9999999)}", new_text)
+
+        # Replace SSN: XXX-XX-XXXX
+        new_text = re.sub(r"\d{3}-\d{2}-\d{4}",
+                          f"{rng.randint(100,999)}-{rng.randint(10,99)}-{rng.randint(1000,9999)}", new_text)
+
+        # Replace account numbers: XXXX-XXXX
+        new_text = re.sub(r"\b\d{4}-\d{4}\b",
+                          f"{rng.randint(1000,9999)}-{rng.randint(1000,9999)}", new_text)
+
+        # Replace US dates: MM/DD/YYYY
+        def _replace_us_date(m: re.Match) -> str:
+            dt = _parse_date(m.group(0))
+            if dt:
+                return _format_date(dt + date_shift, m.group(0))
+            return m.group(0)
+
+        new_text = re.sub(r"\d{1,2}/\d{1,2}/\d{4}", _replace_us_date, new_text)
+
+        # Replace ISO dates: YYYY-MM-DD
+        def _replace_iso_date(m: re.Match) -> str:
+            dt = _parse_date(m.group(0))
+            if dt:
+                return _format_date(dt + date_shift, m.group(0))
+            return m.group(0)
+
+        new_text = re.sub(r"\d{4}-\d{2}-\d{2}", _replace_iso_date, new_text)
+
+        # Replace 8-digit date-like sequences (YYYYMMDD) in date of birth fields
+        def _replace_compact_date(m: re.Match) -> str:
+            s = m.group(0)
+            try:
+                dt = datetime.strptime(s, "%Y%m%d")
+                new_dt = dt + date_shift
+                return new_dt.strftime("%Y%m%d")
+            except ValueError:
+                return s
+
+        new_text = re.sub(r"\b[12]\d{3}[01]\d[0-3]\d\b", _replace_compact_date, new_text)
+
+        # Only record if something changed
+        if new_text != frag.text:
+            replacements.setdefault(frag.page_idx, []).append((frag, new_text))
+
+    return replacements
+
+
+def _create_overlay_page(
+    page_width: float,
+    page_height: float,
+    replacements: list[tuple[_TextFragment, str]],
+) -> bytes:
+    """Create a single-page PDF overlay with white boxes + replacement text.
+
+    Coordinates: pypdf gives positions in PDF units (points, 1pt = 1/72 inch)
+    with origin at bottom-left. fpdf uses mm with origin at top-left.
     """
     from fpdf import FPDF
-    from pypdf import PdfReader
+
+    # Convert points to mm
+    w_mm = page_width * 25.4 / 72
+    h_mm = page_height * 25.4 / 72
+
+    pdf = FPDF(orientation="P", unit="pt", format=(page_width, page_height))
+    pdf.add_page()
+    pdf.set_auto_page_break(auto=False)
+
+    for frag, new_text in replacements:
+        font_size = frag.font_size if frag.font_size > 0 else 8.0
+
+        # Estimate text width for the white cover rectangle
+        # Approximate: each character is ~0.6 * font_size points wide
+        orig_width = len(frag.text) * font_size * 0.55
+        new_width = len(new_text) * font_size * 0.55
+        cover_width = max(orig_width, new_width) + 4  # small padding
+
+        # PDF coordinates: origin at bottom-left
+        # fpdf coordinates: origin at top-left
+        # Convert: fpdf_y = page_height - pdf_y
+        x_pt = frag.x
+        y_pt = page_height - frag.y  # convert to top-left origin
+
+        # Draw white rectangle to cover original text
+        pdf.set_fill_color(255, 255, 255)
+        pdf.set_draw_color(255, 255, 255)
+        rect_y = y_pt - 2  # small padding above
+        rect_h = font_size + 4
+        pdf.rect(x_pt - 1, rect_y, cover_width, rect_h, style="F")
+
+        # Draw replacement text
+        pdf.set_font("Helvetica", "", font_size)
+        pdf.set_text_color(0, 0, 0)
+        pdf.text(x_pt, y_pt + font_size * 0.75, new_text)
+
+    return pdf.output()
+
+
+def anonymize_1042s_pdf(input_path: str, output_path: str,
+                        config: AnonConfig | None = None) -> None:
+    """Anonymize a 1042-S PDF by overlaying replacements on the original.
+
+    Preserves the original layout, pages, and form structure. Only sensitive
+    data (amounts, names, TINs, addresses, dates) is covered with white
+    rectangles and replaced with anonymized values.
+    """
+    from pypdf import PdfReader, PdfWriter
 
     config = config or AnonConfig()
     rng = _make_rng(config.seed)
 
     reader = PdfReader(input_path)
-    full_text = "\n".join(page.extract_text() or "" for page in reader.pages)
-
-    # Extract the tax year
-    tax_year_match = re.search(r"20[0-9]{2}", full_text)
-    tax_year = int(tax_year_match.group()) if tax_year_match else 2025
-
-    date_shift = timedelta(days=rng.randint(*config.date_shift_days))
     price_factor = rng.uniform(*config.price_shift_range)
+    date_shift = timedelta(days=rng.randint(*config.date_shift_days))
 
-    # Try to extract monetary amounts from the PDF text
-    # 1042-S key fields: gross income (Box 2), tax rate (Box 3b),
-    # federal tax withheld (Box 7)
-    amounts = re.findall(r"\$?([\d,]+\.\d{2})\b", full_text)
-    parsed_amounts = []
-    for a in amounts:
-        try:
-            parsed_amounts.append(float(a.replace(",", "")))
-        except ValueError:
-            pass
+    # Extract text with positions
+    fragments = _extract_text_with_positions(reader)
 
-    # Heuristic: largest amount is likely gross income, second largest is tax withheld
-    parsed_amounts.sort(reverse=True)
-    orig_gross = parsed_amounts[0] if len(parsed_amounts) >= 1 else 50000.00
-    orig_tax = parsed_amounts[1] if len(parsed_amounts) >= 2 else orig_gross * 0.30
+    # Build replacement map
+    replacement_map = _build_replacement_map(fragments, rng, price_factor, date_shift)
 
-    # Try to find withholding rate
-    rate_match = re.search(r"(\d{1,2}(?:\.\d+)?)\s*%", full_text)
-    withholding_rate = float(rate_match.group(1)) if rate_match else 30.0
+    # Create output PDF — clone from original to preserve structure
+    writer = PdfWriter(clone_from=reader)
 
-    # Randomize
-    new_gross = round(orig_gross * price_factor, 2)
-    new_tax = round(new_gross * withholding_rate / 100, 2)
+    for page_idx in range(len(writer.pages)):
+        if page_idx in replacement_map and replacement_map[page_idx]:
+            page = writer.pages[page_idx]
+            mediabox = page.mediabox
+            page_width = float(mediabox.width)
+            page_height = float(mediabox.height)
 
-    # Generate clean PDF
-    pdf = FPDF(orientation="P", unit="mm", format="A4")
-    pdf.add_page()
-    pdf.set_auto_page_break(auto=True, margin=15)
+            # Create overlay
+            overlay_bytes = _create_overlay_page(
+                page_width, page_height,
+                replacement_map[page_idx],
+            )
 
-    # Title
-    pdf.set_font("Helvetica", "B", 14)
-    pdf.cell(0, 10, "Form 1042-S", new_x="LMARGIN", new_y="NEXT")
-    pdf.set_font("Helvetica", "", 10)
-    pdf.cell(0, 6, "Foreign Person's U.S. Source Income Subject to Withholding",
-             new_x="LMARGIN", new_y="NEXT")
-    pdf.cell(0, 6, f"Tax Year {tax_year}  [ANONYMIZED]",
-             new_x="LMARGIN", new_y="NEXT")
-    pdf.ln(5)
+            # Merge overlay onto the page (already attached to writer)
+            overlay_reader = PdfReader(io.BytesIO(overlay_bytes))
+            page.merge_page(overlay_reader.pages[0])
 
-    # Box layout
-    def _box(label: str, value: str) -> None:
-        pdf.set_font("Helvetica", "", 8)
-        pdf.cell(90, 5, label, new_x="LMARGIN", new_y="NEXT")
-        pdf.set_font("Helvetica", "B", 11)
-        pdf.cell(90, 7, value, new_x="LMARGIN", new_y="NEXT")
-        pdf.ln(3)
-
-    _box("Box 1 - Income Code", "15 (Compensation for personal services)")
-    _box("Box 2 - Gross Income", f"${new_gross:,.2f}")
-    _box("Box 3 - Chapter 3 Tax Rate", f"{withholding_rate:.2f}%")
-    _box("Box 4a - Exemption Code", "")
-    _box("Box 7 - Federal Tax Withheld", f"${new_tax:,.2f}")
-    _box("Box 7a - Check if federal tax withheld was not deposited with the IRS", "")
-    _box("Box 12a - Withholding Agent's EIN", "XX-XXXXXXX")
-    _box("Box 12b - Withholding Agent's Name", "CHARLES SCHWAB & CO., INC.")
-
-    pdf.ln(5)
-    _box("Box 13a - Recipient's TIN", "XXX-XX-XXXX")
-    _box("Box 13b - Recipient's Name", "JOHN DOE")
-    _box("Box 13c - Recipient's Address", "123 EXAMPLE STRASSE, 10115 BERLIN, GERMANY")
-    _box("Box 13d - Recipient's Country Code", "DE")
-
-    pdf.ln(5)
-    pdf.set_font("Helvetica", "I", 8)
-    pdf.cell(0, 5,
-             "This is an anonymized version of a 1042-S form generated for testing purposes.",
-             new_x="LMARGIN", new_y="NEXT")
-
-    pdf.output(output_path)
+    with open(output_path, "wb") as f:
+        writer.write(f)
 
 
 # ── File type detection & unified entry point ─────────────────────────────
