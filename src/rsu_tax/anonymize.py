@@ -951,6 +951,41 @@ def _anonymize_pdf_string(
         text,
     )
 
+    # Foreign tax identification numbers (e.g. German Steuer-ID: 11 digits,
+    # possibly with spaces like "12 345 678 901" or "12345678901")
+    def _repl_foreign_tax_id(m: re.Match[str]) -> str:
+        # Preserve the spacing pattern of the original
+        orig = m.group(0)
+        digits = re.sub(r"\s", "", orig)
+        new_digits = "".join(str(rng.randint(0, 9)) for _ in digits)
+        # Re-insert spaces at the same positions
+        result = []
+        d = 0
+        for c in orig:
+            if c.isspace():
+                result.append(c)
+            else:
+                result.append(new_digits[d])
+                d += 1
+        return "".join(result)
+
+    # 11-digit tax IDs (with optional spaces)
+    text = re.sub(r"\b\d{2}\s?\d{3}\s?\d{3}\s?\d{3}\b", _repl_foreign_tax_id, text)
+    # 10-digit IDs (some countries)
+    text = re.sub(r"\b\d{10}\b", _repl_foreign_tax_id, text)
+
+    # GIIN: XXXXXX.XXXXX.XX.XXX (Global Intermediary Identification Number)
+    text = re.sub(
+        r"\b[A-Z0-9]{6}\.[A-Z0-9]{5}\.[A-Z]{2}\.\d{3}\b",
+        lambda m: (
+            f"{''.join(rng.choice('ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789') for _ in range(6))}."
+            f"{''.join(rng.choice('ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789') for _ in range(5))}."
+            f"{''.join(rng.choice('ABCDEFGHIJKLMNOPQRSTUVWXYZ') for _ in range(2))}."
+            f"{rng.randint(0, 999):03d}"
+        ),
+        text,
+    )
+
     # US dates: MM/DD/YYYY
     def _repl_us_date(m: re.Match[str]) -> str:
         dt = _parse_date(m.group(0))
