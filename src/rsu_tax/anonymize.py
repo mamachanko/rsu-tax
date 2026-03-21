@@ -1160,7 +1160,10 @@ def _process_page_streams(
                     raw, rng, price_factor, date_shift, replace_names,
                 )
                 if changed:
-                    xobj.set_data(modified)
+                    try:
+                        xobj.set_data(modified)
+                    except Exception:
+                        pass  # skip streams with unsupported filters
 
     # ── 3) Annotation appearance streams (form field widgets) ─────────
     annots = page.get("/Annots")
@@ -1190,7 +1193,10 @@ def _process_page_streams(
                     raw, rng, price_factor, date_shift, replace_names,
                 )
                 if changed:
-                    n_obj.set_data(modified)
+                    try:
+                        n_obj.set_data(modified)
+                    except Exception:
+                        pass  # skip streams with unsupported filters
 
 
 def anonymize_1042s_pdf(
