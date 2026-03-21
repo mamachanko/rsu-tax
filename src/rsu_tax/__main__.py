@@ -81,6 +81,7 @@ def _anonymize(args: list[str]) -> None:
     file_type = anonymize_file(opts.file, output_path, config)
     type_label = {
         "realized_gains": "Realized Gain/Loss CSV",
+        "lapse": "Equity Award Lapse History CSV",
         "vesting": "Vesting History CSV",
         "pdf": "1042-S PDF",
         "csv_unknown": "CSV (unknown type — treated as Realized Gain/Loss)",

@@ -706,6 +706,194 @@ def anonymize_vesting_csv(csv_text: str, config: AnonConfig | None = None) -> st
     return "\n".join(output_lines) + "\n"
 
 
+# ── Lapse (Equity Award) CSV anonymization ────────────────────────────────
+
+def anonymize_lapse_csv(csv_text: str, config: AnonConfig | None = None) -> str:
+    """Anonymize a Schwab Equity Award Lapse History CSV.
+
+    Handles the two-row-per-event structure:
+      Row 1: Date, Action, Symbol, Description, Quantity (lapse-level)
+      Row 2: AwardDate, AwardId, FMV, SalePrice, SharesWithheld, SharesDelivered, Taxes
+    """
+    config = config or AnonConfig()
+    rng = _make_rng(config.seed)
+
+    lines = csv_text.splitlines()
+
+    # Find header row
+    header_idx = 0
+    for i, line in enumerate(lines[:10]):
+        lower = line.lower()
+        if "date" in lower and any(k in lower for k in ("action", "symbol", "fairmarket",
+                                                          "awardid", "awarddate")):
+            header_idx = i
+            break
+
+    csv_block = "\n".join(lines[header_idx:])
+    reader = csv.reader(io.StringIO(csv_block))
+    all_rows = list(reader)
+
+    if not all_rows:
+        return csv_text
+
+    headers = [h.strip() for h in all_rows[0]]
+    data_rows = all_rows[1:]
+
+    # Build column index mapping (case-insensitive, strip quotes)
+    col_idx: dict[str, int] = {}
+    for i, h in enumerate(headers):
+        key = re.sub(r"[^a-z0-9]", "", h.lower())
+        col_idx[key] = i
+
+    date_shift = timedelta(days=rng.randint(*config.date_shift_days))
+    price_factor = rng.uniform(*config.price_shift_range)
+    qty_factor = rng.uniform(*config.quantity_shift_range)
+
+    # Symbol mapping
+    real_symbols: set[str] = set()
+    sym_col = col_idx.get("symbol")
+    if sym_col is not None:
+        for row in data_rows:
+            if sym_col < len(row) and row[sym_col].strip():
+                real_symbols.add(row[sym_col].strip().strip('"'))
+
+    fake_pool = list(_FAKE_COMPANIES)
+    rng.shuffle(fake_pool)
+    symbol_mapping: dict[str, tuple[str, str]] = {}
+    for i, sym in enumerate(sorted(real_symbols)):
+        symbol_mapping[sym] = fake_pool[i % len(fake_pool)]
+
+    # Title rows above header
+    output_lines: list[str] = []
+    for i in range(header_idx):
+        line = lines[i]
+        line = re.sub(r"\.\.\.\d{3,}", "...XXX", line)
+        def _shift_title_date(m: re.Match[str]) -> str:
+            dt = _parse_date(m.group(0))
+            return _format_date(dt + date_shift, m.group(0)) if dt else m.group(0)
+        line = re.sub(r"\d{2}/\d{2}/\d{4}", _shift_title_date, line)
+        for real_sym, (fake_sym, _) in symbol_mapping.items():
+            line = line.replace(real_sym, fake_sym)
+        output_lines.append(line)
+
+    # Header row unchanged
+    buf = io.StringIO()
+    writer = csv.writer(buf, quoting=csv.QUOTE_ALL)
+    writer.writerow(headers)
+    output_lines.append(buf.getvalue().strip())
+
+    # Column indices for the two-row structure
+    date_col = col_idx.get("date")
+    action_col = col_idx.get("action")
+    desc_col = col_idx.get("description")
+    qty_col = col_idx.get("quantity")
+    award_date_col = col_idx.get("awarddate")
+    award_id_col = col_idx.get("awardid")
+    fmv_col = col_idx.get("fairmarketvalueprice")
+    sale_price_col = col_idx.get("saleprice")
+    shares_withheld_col = col_idx.get("sharessoldwithheldfortaxes")
+    shares_deposited_col = col_idx.get("netsharesdeposited")
+    taxes_col = col_idx.get("taxes")
+    fees_col = col_idx.get("feesandcommissions")
+    amount_col = col_idx.get("amount")
+
+    for row in data_rows:
+        if len(row) < len(headers):
+            row.extend([""] * (len(headers) - len(row)))
+
+        # Skip fully empty rows
+        if all(not cell.strip() for cell in row):
+            continue
+
+        # Determine if this is a lapse header row (has Date + Action)
+        # or a detail row (has AwardDate + FMV)
+        has_date = date_col is not None and date_col < len(row) and row[date_col].strip()
+        has_award = award_date_col is not None and award_date_col < len(row) and row[award_date_col].strip()
+
+        if has_date:
+            # ── Lapse header row ──
+            # Shift date
+            if date_col is not None:
+                orig = row[date_col].strip()
+                dt = _parse_date(orig)
+                if dt:
+                    row[date_col] = _format_date(dt + date_shift, orig)
+
+            # Replace symbol + description
+            if sym_col is not None:
+                orig_sym = row[sym_col].strip().strip('"')
+                if orig_sym in symbol_mapping:
+                    fake_sym, fake_name = symbol_mapping[orig_sym]
+                    row[sym_col] = fake_sym
+                    if desc_col is not None:
+                        row[desc_col] = "Restricted Stock Lapse"
+
+            # Scale quantity
+            if qty_col is not None:
+                orig_qty = _parse_currency(row[qty_col])
+                if orig_qty is not None and orig_qty > 0:
+                    row[qty_col] = str(max(1, round(orig_qty * qty_factor)))
+
+        if has_award:
+            # ── Award detail row ──
+            # Shift award date
+            if award_date_col is not None:
+                orig = row[award_date_col].strip()
+                dt = _parse_date(orig)
+                if dt:
+                    row[award_date_col] = _format_date(dt + date_shift, orig)
+
+            # Randomize award ID
+            if award_id_col is not None and row[award_id_col].strip():
+                row[award_id_col] = f"AWD-{rng.randint(100000, 999999)}"
+
+            # Scale FMV
+            if fmv_col is not None:
+                orig = _parse_currency(row[fmv_col])
+                if orig is not None and orig > 0:
+                    row[fmv_col] = _format_currency(round(orig * price_factor, 2), row[fmv_col])
+
+            # Scale sale price
+            if sale_price_col is not None:
+                orig = _parse_currency(row[sale_price_col])
+                if orig is not None and orig > 0:
+                    row[sale_price_col] = _format_currency(round(orig * price_factor, 2), row[sale_price_col])
+
+            # Scale shares withheld
+            if shares_withheld_col is not None:
+                orig = _parse_currency(row[shares_withheld_col])
+                if orig is not None and orig > 0:
+                    row[shares_withheld_col] = str(max(0, round(orig * qty_factor)))
+
+            # Scale shares deposited
+            if shares_deposited_col is not None:
+                orig = _parse_currency(row[shares_deposited_col])
+                if orig is not None and orig > 0:
+                    row[shares_deposited_col] = str(max(0, round(orig * qty_factor)))
+
+            # Scale taxes
+            if taxes_col is not None:
+                orig = _parse_currency(row[taxes_col])
+                if orig is not None and orig > 0:
+                    row[taxes_col] = _format_currency(
+                        round(orig * price_factor * qty_factor, 2), row[taxes_col],
+                    )
+
+        # Clear fees/amount if present
+        for col in [fees_col, amount_col]:
+            if col is not None and col < len(row):
+                orig = _parse_currency(row[col])
+                if orig is not None and orig != 0:
+                    row[col] = _format_currency(round(orig * price_factor * qty_factor, 2), row[col])
+
+        buf = io.StringIO()
+        writer = csv.writer(buf, quoting=csv.QUOTE_ALL)
+        writer.writerow(row)
+        output_lines.append(buf.getvalue().strip())
+
+    return "\n".join(output_lines) + "\n"
+
+
 # ── 1042-S PDF anonymization ──────────────────────────────────────────────
 
 # Words/phrases that are part of the form template (not personal data).
@@ -1384,16 +1572,22 @@ def debug_pdf_extraction(input_path: str, config: AnonConfig | None = None) -> s
 # ── File type detection & unified entry point ─────────────────────────────
 
 def _detect_file_type(path: str, text: str | None = None) -> str:
-    """Detect file type: 'realized_gains', 'vesting', or 'pdf'."""
+    """Detect file type: 'realized_gains', 'lapse', 'vesting', or 'pdf'."""
     ext = os.path.splitext(path)[1].lower()
     if ext == ".pdf":
         return "pdf"
 
-    # For CSVs, peek at content to distinguish realized gains from vesting
+    # For CSVs, peek at content to distinguish types
     if text is None:
         return "csv_unknown"
 
     lower = text[:2000].lower()
+
+    # Lapse CSV: has "lapse" in Action column or "fairmarketvalueprice" header
+    if any(kw in lower for kw in ("fairmarketvalueprice", "netshares deposited",
+                                   "netsharesdeposited", "sharessoldwithheldfortaxes",
+                                   '"lapse"')):
+        return "lapse"
 
     # Realized gains: has "proceeds" or "gain/loss" or "cost basis"
     if any(kw in lower for kw in ("proceeds", "gain/loss", "cost basis", "realized gain")):
@@ -1404,8 +1598,7 @@ def _detect_file_type(path: str, text: str | None = None) -> str:
                                    "shares withheld")):
         return "vesting"
 
-    # Fallback: treat as generic CSV and apply realized gains anonymizer
-    # (it's the more conservative option — won't break on unknown layouts)
+    # Fallback
     return "csv_unknown"
 
 
@@ -1434,7 +1627,9 @@ def anonymize_file(input_path: str, output_path: str, config: AnonConfig | None 
 
     file_type = _detect_file_type(input_path, text)
 
-    if file_type == "vesting":
+    if file_type == "lapse":
+        result = anonymize_lapse_csv(text, config)
+    elif file_type == "vesting":
         result = anonymize_vesting_csv(text, config)
     else:
         result = anonymize_realized_gains_csv(text, config)

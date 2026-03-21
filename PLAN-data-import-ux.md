@@ -8,49 +8,113 @@ Currently the app accepts a **single file**: the Schwab "Realized Gain/Loss" CSV
 
 ## 1. What Files Does Schwab Provide?
 
-When a user follows all the steps in the current info dialog, they end up with:
+A user with RSUs at Schwab has **two separate account views**:
 
-| # | File / Data | Source in Schwab | Format | What's in it |
-|---|-------------|------------------|--------|-------------|
-| **A** | **Realized Gain/Loss** | EAC → Realized Gain/Loss → Export | CSV | Per-lot: symbol, sale date, acquisition date (sometimes missing), proceeds, cost basis, gain/loss, term, wash sale, cost basis method |
-| **B** | **Transaction History (Vesting Events)** | EAC → History → Transactions → filter "Vest" → Export | CSV / JSON / screen scrape | Per-vest: vest date, shares vested, shares delivered (after withholding), FMV per share on vest date, share withholding count |
-| **C** | **Transaction History (Sales)** | EAC → History → Transactions → filter "Sale" → Export | CSV / JSON / screen scrape | Per-sale: sale date, shares sold, gross sale price per share, net proceeds |
-| **D** | **1042-S** (non-US residents) | Statements → Tax Forms | PDF | US-source income from RSU vesting, US tax withheld (rate, amount), treaty info |
+1. **Equity Award Center (EAC)** — the RSU/award management portal
+2. **Individual Brokerage Account** — the regular trading account where delivered shares land
 
-> **Note:** The 1099-B is a US-resident-only form. As German tax residents, we will never receive one. It is excluded from this plan entirely.
+### The three files we need
+
+| # | File | Where in Schwab | Format | What's in it |
+|---|------|-----------------|--------|-------------|
+| **A** | **Realized Gain/Loss** | EAC → "Realized Gain/Loss" view → Export | CSV | Per-lot: symbol, sale date, acquisition date (often missing), proceeds, cost basis, gain/loss, term, wash sale, cost basis method |
+| **B** | **Equity Award Lapse History** | EAC → filter by "Lapse" → Export | CSV | Per-vest event: lapse date, shares vested, shares withheld for taxes, shares delivered, FMV per share, sale price, award ID |
+| **C** | **1042-S** (non-US residents) | Schwab → Statements → Tax Forms | PDF | US-source income from RSU vesting, US tax withheld (rate, amount), treaty info |
+
+### What we do NOT need
+
+| File | Why excluded |
+|------|-------------|
+| **Individual Account Trade History** | Shows the same sells from the brokerage side, but without cost basis or gain/loss. Fully redundant with file A. |
+| **1099-B** | US-resident-only form. German tax residents never receive it. |
 
 ### Classification: Required vs Optional
 
 | File | Required? | Why |
 |------|-----------|-----|
 | **A — Realized Gain/Loss CSV** | **Required** | Core data for EUR capital gains calculation. Already supported. |
-| **B — Vesting History** | **Recommended** | Fills in missing acquisition dates and provides authoritative FMV (cost basis) per share. Improves accuracy. |
-| **C — Sale History** | **Optional (defer)** | Cross-verification of sale prices and proceeds. Redundant with file A. Deferred from v1. |
-| **D — 1042-S** | **Optional (beneficial)** | Enables reporting US tax withheld for foreign tax credit claims on the German return (Anlage AUS). |
+| **B — Equity Award Lapse CSV** | **Recommended** | Fills missing acquisition dates and provides authoritative FMV (= cost basis per share) on vest date. Critical for correct EUR conversion. |
+| **C — 1042-S** | **Optional** | Enables reporting US tax withheld for foreign tax credit (Anlage AUS). |
 
 ---
 
-## 2. What New Data Would We Gain?
+## 2. Actual File Structures (from real Schwab exports)
 
-### From Vesting History (File B):
-- **Authoritative vest date** → currently often missing from Realized Gain/Loss
-- **FMV per share on vest date** → the true cost basis per share (can cross-check file A)
-- **Shares withheld for taxes** → enables calculating the share withholding ratio
-- **Total shares vested vs delivered** → full picture of the RSU event
+### File A: Realized Gain/Loss CSV (already supported)
 
-### From 1042-S (File D):
-- **US tax withheld amount** (USD)
-- **Withholding rate** (typically 30% or treaty-reduced 15%)
-- **Gross income from RSU vesting** (USD)
-- Enables: foreign tax credit calculation for German Anlage AUS
+Exported from: EAC → Realized Gain/Loss → Export
 
-### From Sale History (File C):
-- **Per-share sale price** → cross-verify with Realized Gain/Loss proceeds
-- **Net vs gross proceeds** → detect commission/fee deductions
+```csv
+"Symbol","Name","Date Sold","Date Acquired","Quantity","Proceeds","Cost Basis (CB)","Total Gain/Loss","..."
+"AVGO","BROADCOM INC","03/17/2026","12/15/2024","61","$19,690.08","$19,607.18","$82.90","..."
+```
+
+### File B: Equity Award Lapse History CSV (NEW)
+
+Exported from: EAC → filter transactions by "Lapse" → Export
+
+**Key insight:** This file uses a **two-row-per-event** structure. The first row has the lapse-level data (date, action, symbol, total quantity). The second row has the per-award detail (award date, award ID, FMV, sale price, shares withheld, shares delivered, taxes).
+
+```csv
+"Date","Action","Symbol","Description","Quantity","FeesAndCommissions","DisbursementElection","Amount","AwardDate","AwardId","FairMarketValuePrice","SalePrice","SharesSoldWithheldForTaxes","NetSharesDeposited","Taxes"
+"03/15/2026","Lapse","AVGO","Restricted Stock Lapse","30","","","","","","","","","",""
+"","","","","","","","","11/22/2023","VM-00225234","$321.43","$322.79","15","15","$4,577.97"
+"03/15/2026","Lapse","AVGO","Restricted Stock Lapse","88","","","","","","","","","",""
+"","","","","","","","","03/15/2025","422361","$321.43","$322.79","42","46","$13,428.70"
+```
+
+**Fields:**
+- Row 1 (lapse header): `Date` (vest/lapse date), `Action` ("Lapse"), `Symbol`, `Description`, `Quantity` (total shares in this lapse)
+- Row 2 (award detail): `AwardDate`, `AwardId`, `FairMarketValuePrice` (FMV per share at vest), `SalePrice` (sell-to-cover sale price), `SharesSoldWithheldForTaxes`, `NetSharesDeposited`, `Taxes` (USD tax withheld)
+
+**What this gives us:**
+- `Date` = the **vest date** (= acquisition date for German tax purposes)
+- `FairMarketValuePrice` = the **FMV per share** (= acquisition cost per share)
+- `SalePrice` = the **sell-to-cover price** (should match proceeds in file A)
+- `SharesSoldWithheldForTaxes` + `NetSharesDeposited` = `Quantity` (total shares)
+- `Taxes` = US tax withheld per event (can cross-verify with 1042-S)
+
+### File C: 1042-S PDF (already supported for anonymization)
+
+IRS form showing US-source income and tax withheld. Key boxes:
+- Box 2: Gross income (USD)
+- Box 7: Federal tax withheld (USD)
+- Box 3b: Tax rate (e.g., 30% or treaty 15%)
 
 ---
 
-## 3. Frontend UX Redesign
+## 3. How the Files Fit Together
+
+For German RSU tax (Abgeltungssteuer), the core calculation per lot is:
+
+```
+Gain/Loss (EUR) = Proceeds (EUR) − Cost Basis (EUR)
+
+where:
+  Proceeds (EUR)   = proceeds_usd × ECB_rate(sell_date)
+  Cost Basis (EUR) = cost_basis_usd × ECB_rate(acquisition_date)
+```
+
+The **critical insight**: proceeds and cost basis are each converted at **different ECB rates** — the sell date rate and the acquisition (vest) date rate respectively. Getting the acquisition date wrong means using the wrong exchange rate, which changes the taxable gain.
+
+### Data flow
+
+```
+File A: Realized Gain/Loss CSV    →  sell transactions (date, proceeds, cost basis USD)
+         │                              ↓
+         │  Problem: acquisition date often MISSING
+         │                              ↓
+File B: Lapse History CSV          →  fills in vest date + verifies FMV per share
+         │                              = correct ECB rate for cost basis
+         │
+File C: 1042-S PDF (optional)     →  US tax withheld for Anlage AUS
+```
+
+Without File B, the app falls back to using the **sell date** ECB rate for cost basis conversion — which is wrong and produces inaccurate EUR gains.
+
+---
+
+## 4. Frontend UX Redesign
 
 ### Current UX
 Single drop zone → upload CSV → results.
@@ -71,7 +135,7 @@ Replace the single upload with a **multi-section file import** interface:
 │  └───────────────────────────────────────────────┘  │
 │                                                     │
 │  ┌───────────────────────────────────────────────┐  │
-│  │ 2. Vesting History                RECOMMENDED │  │
+│  │ 2. Lapse History CSV            RECOMMENDED   │  │
 │  │    [  Drop CSV here or click to browse     ]  │  │
 │  │    Adds vest dates & FMV per share            │  │
 │  └───────────────────────────────────────────────┘  │
@@ -96,7 +160,7 @@ Replace the single upload with a **multi-section file import** interface:
 
 **Info dialog redesign — "Your Schwab Files" guide:**
 
-The current info dialog is vague ("look up vesting data"). The new dialog should create a clear mental model: "here's exactly what you'll download, and here's what you'll end up with."
+The current info dialog is vague. The new dialog should create a clear mental model: "here's exactly what you'll download, and here's what you'll end up with."
 
 Structure:
 
@@ -122,30 +186,31 @@ Structure:
 │  A CSV file with one row per lot sold — symbol, dates,      │
 │  proceeds, cost basis, and gain/loss in USD.                │
 │                                                             │
-│  ── File 2: Vesting History (RECOMMENDED) ──────────────── │
+│  ── File 2: Lapse History (RECOMMENDED) ────────────────── │
 │                                                             │
-│  This gives us authoritative vest dates and the fair market │
-│  value per share — improving accuracy of your EUR cost      │
-│  basis calculation.                                         │
+│  This gives us the vest date and fair market value per      │
+│  share — so we can convert your cost basis at the correct   │
+│  EUR exchange rate (which is often different from the sell   │
+│  date rate).                                                │
 │                                                             │
 │  Where to get it:                                           │
-│  1. In Equity Award Center, click "History"                 │
-│  2. Go to "Transactions" tab                                │
-│  3. Filter by event type: "Vest"                            │
-│  4. Set date range to cover your tax year                   │
-│  5. Click "Export" → CSV                                    │
+│  1. In Equity Award Center, go to your transaction history  │
+│  2. Filter by transaction type: "Lapse"                     │
+│  3. Set date range to cover your tax year                   │
+│  4. Click "Export" → CSV                                    │
 │                                                             │
 │  What you'll get:                                           │
-│  A CSV with one row per vesting event — vest date, shares   │
-│  vested, shares delivered, shares withheld, FMV per share.  │
+│  A CSV with one entry per vesting event — vest date,        │
+│  shares vested/withheld/delivered, FMV per share, and the   │
+│  sell-to-cover sale price.                                  │
 │                                                             │
-│  ── File 3: 1042-S Tax Form (OPTIONAL) ────────────────── │
+│  ── File 3: 1042-S Tax Form (OPTIONAL) ─────────────────── │
 │                                                             │
 │  If you want to claim a foreign tax credit on your German   │
 │  return (Anlage AUS), this form has the US tax withheld.    │
 │                                                             │
 │  Where to get it:                                           │
-│  1. Go to Accounts → Statements                            │
+│  1. On schwab.com, go to Accounts → Statements             │
 │  2. Click "Tax Forms" tab                                   │
 │  3. Find your 1042-S for the relevant tax year              │
 │  4. Download PDF                                            │
@@ -159,44 +224,43 @@ Structure:
 │  After following these steps you should have:               │
 │                                                             │
 │  ✓ realized-gain-loss.csv ............ REQUIRED             │
-│  ✓ vesting-history.csv ............... RECOMMENDED          │
+│  ✓ lapse-history.csv ................. RECOMMENDED          │
 │  ○ 1042-S.pdf ........................ OPTIONAL             │
 │                                                             │
 │  Upload them above and click Calculate.                     │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-**Key improvement:** The dialog ends with a concrete "file checklist" so the user knows exactly which files they should have on disk before proceeding.
-
 ---
 
-## 4. Backend Changes
+## 5. Backend Changes
 
-### 4a. New Parser: Vesting History CSV (`vesting_parser.py`)
+### 5a. New Parser: Lapse History CSV (`lapse_parser.py`)
 
-Parse Schwab EAC transaction history filtered to vesting events.
+Parse Schwab EAC transaction history filtered to "Lapse" events.
 
-**Expected columns** (with auto-detection like existing parser):
-- Date, Event Type ("Vest"), Symbol
-- Shares Vested, Shares Delivered, Shares Withheld
-- FMV / Fair Market Value per share (USD)
-- Award ID / Grant ID (optional, for matching)
+**Two-row structure:** Each lapse event spans two CSV rows:
+- Row 1: `Date`, `Action`, `Symbol`, `Description`, `Quantity` (lapse-level)
+- Row 2: `AwardDate`, `AwardId`, `FairMarketValuePrice`, `SalePrice`, `SharesSoldWithheldForTaxes`, `NetSharesDeposited`, `Taxes` (award-level)
 
-**Output model** — new `VestingEvent`:
+**Output model** — new `LapseEvent`:
 ```python
-class VestingEvent(BaseModel):
+class LapseEvent(BaseModel):
     symbol: str
-    vest_date: str           # YYYY-MM-DD
-    shares_vested: float
-    shares_delivered: float
-    shares_withheld: float
-    fmv_per_share_usd: float  # Fair Market Value on vest date
+    lapse_date: str                    # YYYY-MM-DD — the vest/lapse date
+    total_shares: float                # from row 1 Quantity
+    award_date: str | None = None      # YYYY-MM-DD — original grant date
     award_id: str | None = None
+    fmv_per_share_usd: float           # FairMarketValuePrice — acquisition cost
+    sale_price_usd: float              # SalePrice — sell-to-cover price
+    shares_sold_for_taxes: float       # SharesSoldWithheldForTaxes
+    shares_delivered: float            # NetSharesDeposited
+    taxes_usd: float                   # Taxes — US tax withheld
 ```
 
-### 4b. New Parser: 1042-S PDF (`tax_form_parser.py`)
+### 5b. New Parser: 1042-S PDF (`tax_form_parser.py`)
 
-Extract key fields from the 1042-S PDF. This is simpler — just a few numbers:
+Extract key fields from the 1042-S PDF.
 
 **Output model** — new `TaxFormData`:
 ```python
@@ -209,18 +273,19 @@ class TaxFormData(BaseModel):
     recipient_country: str | None = None
 ```
 
-**Implementation note:** PDF parsing can use `pdfplumber` or similar. If parsing is unreliable, fall back to manual entry fields for the 3 key numbers (gross income, tax withheld, rate).
+**Implementation note:** PDF parsing can use `pypdf` (already a dependency). If parsing is unreliable, fall back to manual entry fields for the 3 key numbers.
 
-### 4c. Data Enrichment Pipeline
+### 5c. Data Enrichment Pipeline
 
 Modify `calculator.py` to merge data sources:
 
 ```
 Realized Gain/Loss (required)
         │
-        ├── + Vesting History (if provided)
-        │     → Fill in missing acquisition dates
-        │     → Cross-verify cost basis (FMV × shares = cost_basis_usd)
+        ├── + Lapse History (if provided)
+        │     → Fill in missing acquisition dates (lapse_date = vest date)
+        │     → Cross-verify cost basis: FMV_per_share × shares = cost_basis_usd
+        │     → Record sell-to-cover price for verification
         │     → Add shares_withheld info
         │
         ├── + 1042-S (if provided)
@@ -230,24 +295,25 @@ Realized Gain/Loss (required)
         └── → Compute EUR gains (existing logic, unchanged)
 ```
 
-**Matching logic (Vesting → Realized Gain/Loss):**
-- Match by symbol + acquisition date = vest date
-- If acquisition date is missing in Realized G/L, match by cost_basis_usd ≈ FMV × quantity
-- Add verification check: "Vesting data cross-check" (pass/warn)
+**Matching logic (Lapse → Realized Gain/Loss):**
+- Primary: match by `symbol` + `quantity` + `lapse_date ≈ date_acquired`
+- Fallback: match by `cost_basis_usd ≈ FMV × quantity` (when acquisition date is missing in file A)
+- Verification: `sale_price × shares_sold_for_taxes ≈ proceeds` in matching sell-to-cover lots
+- Add verification check: "Lapse data cross-check" (pass/warn)
 
-### 4d. Updated Route: `/upload`
+### 5d. Updated Route: `/upload`
 
 Accept multiple files in the form:
 ```python
 @app.post("/upload")
 async def upload(
     file: UploadFile,                          # Required: Realized Gain/Loss CSV
-    vesting_file: UploadFile | None = None,    # Optional: Vesting History CSV
+    lapse_file: UploadFile | None = None,      # Optional: Lapse History CSV
     tax_form_file: UploadFile | None = None,   # Optional: 1042-S PDF
 ):
 ```
 
-### 4e. Enhanced Models
+### 5e. Enhanced Models
 
 Add to `TaxSummary`:
 ```python
@@ -260,25 +326,25 @@ gross_vesting_income_usd: float | None = None
 
 Add to `ComputedTransaction`:
 ```python
-# New fields (optional, only populated if vesting data provided)
+# New fields (optional, only populated if lapse data provided)
 fmv_per_share_usd: float | None = None
 shares_withheld: float | None = None
-vesting_data_matched: bool = False
+lapse_data_matched: bool = False
 ```
 
-### 4f. New Verification Checks
+### 5f. New Verification Checks
 
-Add to the existing 7 checks:
-- **#8 — Vesting Data Cross-Check**: If vesting file provided, verify cost basis matches FMV × quantity (within tolerance)
-- **#9 — Acquisition Date Enrichment**: Report how many transactions had missing dates filled in from vesting data
-- **#10 — 1042-S Consistency**: If 1042-S provided, check that gross income ≈ sum of cost bases for the same tax year
+Add to the existing checks:
+- **Lapse Data Cross-Check**: If lapse file provided, verify cost basis matches FMV × quantity (within tolerance)
+- **Acquisition Date Enrichment**: Report how many transactions had missing dates filled in from lapse data
+- **1042-S Consistency**: If 1042-S provided, check that gross income ≈ sum of cost bases for the same tax year
 
 ---
 
-## 5. Export Enhancements
+## 6. Export Enhancements
 
 ### CSV Export
-- Add columns: `FMV/Share (USD)`, `Shares Withheld`, `Vesting Matched`
+- Add columns: `FMV/Share (USD)`, `Shares Withheld`, `Lapse Matched`
 - Add US tax withheld row in summary section (if available)
 
 ### PDF Export
@@ -292,110 +358,60 @@ Add to the existing 7 checks:
 
 ---
 
-## 6. Anonymization / Randomization Tool
+## 7. Anonymization Tool
 
-A CLI tool (or web UI button) that takes real Schwab files and produces randomized versions safe for use as test data, demo data, or sharing with AI assistants.
+A CLI tool that takes real Schwab files and produces randomized versions safe for use as test data, demo data, or sharing with AI assistants.
+
+### Supported file types:
+- Realized Gain/Loss CSV ✅ (implemented)
+- Lapse History CSV — needs new anonymizer for two-row structure
+- 1042-S PDF ✅ (implemented)
 
 ### What it anonymizes:
 
 | Field | Strategy |
 |-------|----------|
-| Symbol / Company name | Replace with fake ticker + name (e.g., `XYZC` / `EXAMPLE CORP`) |
+| Symbol / Company name | Replace with fake ticker + name |
 | Account numbers | Strip or replace with `...XXX` |
 | Quantities | Multiply by random factor (0.5–2.0), round to whole shares |
-| Prices / Proceeds / Cost basis | Shift by random ±5–15%, keep internal consistency (proceeds = price × qty) |
-| Dates | Shift all dates by same random offset (±30–90 days) to preserve relative ordering |
-| Gain/Loss | Recompute from randomized proceeds − cost basis |
+| Prices / Proceeds / Cost basis | Shift by random ±5–15%, keep internal consistency |
+| Dates | Shift all dates by same random offset (±30–90 days) |
+| Gain/Loss / Taxes | Recompute from randomized values |
 | Names / Addresses (in 1042-S) | Replace with placeholder text |
-| Award IDs / Grant IDs | Randomize |
-
-### Key properties preserved:
-- **Internal consistency**: gain/loss = proceeds − cost basis still holds
-- **Relative date ordering**: acquisition before sale, vesting before sale
-- **Realistic ranges**: prices stay in plausible stock price territory
-- **File format**: output is valid CSV/PDF that the app can still parse
-
-### Implementation:
-
-```
-src/rsu_tax/anonymize.py     — core anonymization logic
-src/rsu_tax/cli.py            — CLI entry point: `rsu-tax anonymize <file> [--output <dir>]`
-```
-
-- Works on all supported file types (Realized G/L CSV, Vesting CSV, 1042-S PDF)
-- Applies a random seed (optionally user-provided for reproducibility)
-- Outputs anonymized files to a specified directory (default: `./anonymized/`)
-- Also usable from the web UI: a small "Anonymize my files" utility page
+| Award IDs | Randomize |
+| Foreign tax IDs / TINs / GIINs | Randomize (preserving format) |
 
 ---
 
-## 7. Implementation Order
+## 8. Implementation Order
 
-| Phase | Scope | Effort |
+| Phase | Scope | Status |
 |-------|-------|--------|
-| **Phase 0** | Anonymization tool (unblocks everything else — produces test data) | Medium |
-| **Phase 1** | Frontend: multi-file upload UX + updated info dialog | Medium |
-| **Phase 2** | Vesting history parser + data enrichment + matching | Medium |
-| **Phase 3** | Backend: merge vesting data into calculation pipeline | Medium |
-| **Phase 4** | 1042-S PDF parsing + tax withholding integration | Medium |
-| **Phase 5** | Updated verification checks (#8-#10) | Small |
-| **Phase 6** | Export enhancements (CSV, PDF, Markdown) | Small |
-| **Phase 7** | Tests for all new parsers and enrichment logic | Medium |
-
-### Phase 0 — Anonymization Tool (start here)
-- Create `anonymize.py` with randomization logic for CSV files
-- Add CLI entry point (`rsu-tax anonymize`)
-- User runs this on their real files → produces safe test data for `test-data/`
-- This unblocks all other phases by providing realistic sample files
-
-### Phase 1 — Frontend
-- Redesign `index.html` with multi-section upload
-- Update info overlay with detailed per-file download instructions and file checklist
-- Modify form to send multiple files via HTMX
-- Update `app.py` route to accept optional files (pass-through initially)
-
-### Phase 2 — Vesting Parser
-- Create `vesting_parser.py` with column auto-detection
-- Add `VestingEvent` model
-- Write tests with anonymized sample vesting CSV
-
-### Phase 3 — Data Enrichment
-- Add matching logic in `calculator.py`
-- Fill missing acquisition dates from vesting data
-- Cross-verify cost basis
-- Update `ComputedTransaction` model
-
-### Phase 4 — 1042-S
-- Add PDF parsing (or manual fallback fields)
-- Create `TaxFormData` model
-- Integrate into summary
-
-### Phase 5 — Verification
-- Add checks #8-#10
-- Update verification UI
-
-### Phase 6 — Exports
-- Update all three export formats
-
-### Phase 7 — Tests
-- Parser tests (vesting CSV, 1042-S)
-- Enrichment/matching tests
-- Integration tests with multi-file upload
+| **Phase 0** | Anonymization tool | ✅ Done (CSV + PDF anonymizers) |
+| **Phase 0b** | Add Lapse CSV anonymizer (two-row structure) | Pending |
+| **Phase 1** | Frontend: multi-file upload UX + updated info dialog | Pending |
+| **Phase 2** | Lapse history parser + `LapseEvent` model | Pending |
+| **Phase 3** | Data enrichment: merge lapse data into calculation pipeline | Pending |
+| **Phase 4** | 1042-S PDF parsing + tax withholding integration | Pending |
+| **Phase 5** | Updated verification checks | Pending |
+| **Phase 6** | Export enhancements (CSV, PDF, Markdown) | Pending |
+| **Phase 7** | Tests for all new parsers and enrichment logic | Pending |
 
 ---
 
-## 7. Open Questions / Decisions Needed
+## 9. Open Questions / Decisions Needed
 
-1. **Vesting History format**: Schwab's EAC transaction export format needs to be confirmed. The user should run the anonymization tool on a real export so we can see the actual column names. We design the parser flexibly with column auto-detection (like the existing CSV parser).
+1. **Lapse CSV quirks**: The two-row-per-event structure is unusual. Need to confirm whether multiple award IDs can appear under a single lapse date (the sample data suggests yes — e.g., 03/15/2026 has 3 lapse events for different awards).
 
 2. **1042-S parsing reliability**: PDF parsing of tax forms can be fragile. Should we:
    - (a) Attempt automatic PDF parsing with fallback to manual entry, or
    - (b) Just provide 3 manual input fields (gross income, tax withheld, rate)?
 
-3. **Sale History (File C)**: Deferred from v1 — mostly redundant with Realized Gain/Loss data.
+3. **Matching edge cases**: What if a sell-to-cover in file A doesn't exactly match a lapse event in file B (due to rounding, partial lots, etc.)? Need tolerance strategy.
 
 ### Decisions already made
 
-- **1099-B**: Excluded entirely. As German tax residents we never receive this US-only form.
-- **Anonymization tool**: Phase 0 — build first to unblock test data for all other phases.
-- **Info dialog**: Full rewrite with per-file download instructions and a file checklist summary.
+- **1099-B**: Excluded entirely. German tax residents never receive this.
+- **Individual Account Trade History**: Excluded — redundant with Realized Gain/Loss.
+- **Anonymization tool**: Phase 0 — built first to unblock test data.
+- **Info dialog**: Full rewrite with per-file download instructions and file checklist.
