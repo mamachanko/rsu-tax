@@ -1059,15 +1059,33 @@ def _is_name_candidate(text: str) -> bool:
     return True
 
 
-def _replace_name(text: str, rng: "random.Random") -> str:
-    """Replace a name/address candidate with a fake one."""
+@dataclass
+class _FakeIdentity:
+    """Pre-selected consistent fake identity for a PDF."""
+
+    name: str
+    address: str
+    city: str
+
+
+def _pick_identity(rng: "random.Random") -> _FakeIdentity:
+    """Pick one consistent fake identity (name + address + city)."""
+    return _FakeIdentity(
+        name=rng.choice(_FAKE_NAMES),
+        address=rng.choice(_FAKE_ADDRESSES),
+        city=rng.choice(_FAKE_CITIES),
+    )
+
+
+def _replace_name(text: str, identity: _FakeIdentity) -> str:
+    """Replace a name/address candidate with the consistent fake identity."""
     if any(kw in text.lower() for kw in ("street", "str", "weg", "allee",
                                           "road", "way", "ave", "blvd",
                                           "platz", "gasse")):
-        return rng.choice(_FAKE_ADDRESSES)
+        return identity.address
     if re.search(r"\d{4,5}\s", text):
-        return rng.choice(_FAKE_CITIES)
-    return rng.choice(_FAKE_NAMES)
+        return identity.city
+    return identity.name
 
 
 def _anonymize_pdf_string(
@@ -1076,6 +1094,7 @@ def _anonymize_pdf_string(
     price_factor: float,
     date_shift: timedelta,
     replace_names: bool,
+    identity: _FakeIdentity | None = None,
 ) -> bytes:
     """Apply anonymization to a single decoded PDF text string.
 
@@ -1203,7 +1222,7 @@ def _anonymize_pdf_string(
         # Only consider name replacement if no pattern-based change was made
         # (avoids double-processing strings that contain amounts AND names)
         if _is_name_candidate(text):
-            text = _replace_name(text, rng)
+            text = _replace_name(text, identity or _pick_identity(rng))
 
     if text != original:
         return text.encode("latin-1", errors="replace")
@@ -1216,6 +1235,7 @@ def _process_content_stream(
     price_factor: float,
     date_shift: timedelta,
     replace_names: bool,
+    identity: _FakeIdentity | None = None,
 ) -> bytes:
     """Walk a raw PDF content stream, find all literal strings and hex
     strings, and apply anonymization replacements in-place.
@@ -1232,6 +1252,7 @@ def _process_content_stream(
             # Apply anonymization
             new_bytes = _anonymize_pdf_string(
                 string_bytes, rng, price_factor, date_shift, replace_names,
+                identity,
             )
 
             # Re-encode into the stream
@@ -1248,6 +1269,7 @@ def _process_content_stream(
             hex_content = data[i + 1 : end]
             new_hex = _process_hex_string(
                 hex_content, rng, price_factor, date_shift, replace_names,
+                identity,
             )
             result.extend(b"<")
             result.extend(new_hex)
@@ -1266,6 +1288,7 @@ def _process_hex_string(
     price_factor: float,
     date_shift: timedelta,
     replace_names: bool,
+    identity: _FakeIdentity | None = None,
 ) -> bytes:
     """Process a PDF hex string (the content between < and >)."""
     try:
@@ -1280,7 +1303,7 @@ def _process_hex_string(
         return hex_content
 
     new_bytes = _anonymize_pdf_string(
-        raw_bytes, rng, price_factor, date_shift, replace_names,
+        raw_bytes, rng, price_factor, date_shift, replace_names, identity,
     )
     if new_bytes is raw_bytes:
         return hex_content
@@ -1312,10 +1335,11 @@ def _process_stream_data(
     price_factor: float,
     date_shift: timedelta,
     replace_names: bool,
+    identity: _FakeIdentity | None = None,
 ) -> tuple[bytes, bool]:
     """Process a single content stream.  Returns (modified_data, changed)."""
     modified = _process_content_stream(
-        raw, rng, price_factor, date_shift, replace_names,
+        raw, rng, price_factor, date_shift, replace_names, identity,
     )
     return modified, modified != raw
 
@@ -1327,6 +1351,7 @@ def _process_page_streams(
     price_factor: float,
     date_shift: timedelta,
     replace_names: bool,
+    identity: _FakeIdentity | None = None,
 ) -> None:
     """Process all content streams on a page: direct contents, XObject Form
     streams, and annotation appearance streams."""
@@ -1348,6 +1373,7 @@ def _process_page_streams(
                 raw = stream_obj.get_data()
                 modified, changed = _process_stream_data(
                     raw, rng, price_factor, date_shift, replace_names,
+                    identity,
                 )
                 if changed:
                     new_stream = DecodedStreamObject()
@@ -1356,7 +1382,7 @@ def _process_page_streams(
         else:
             raw = contents_obj.get_data()
             modified, changed = _process_stream_data(
-                raw, rng, price_factor, date_shift, replace_names,
+                raw, rng, price_factor, date_shift, replace_names, identity,
             )
             if changed:
                 new_stream = DecodedStreamObject()
@@ -1381,6 +1407,7 @@ def _process_page_streams(
                     continue
                 modified, changed = _process_stream_data(
                     raw, rng, price_factor, date_shift, replace_names,
+                    identity,
                 )
                 if changed:
                     try:
@@ -1414,6 +1441,7 @@ def _process_page_streams(
                     continue
                 modified, changed = _process_stream_data(
                     raw, rng, price_factor, date_shift, replace_names,
+                    identity,
                 )
                 if changed:
                     try:
@@ -1440,6 +1468,7 @@ def anonymize_1042s_pdf(
     date_shift = timedelta(days=rng.randint(*config.date_shift_days))
 
     writer = PdfWriter(clone_from=reader)
+    identity = _pick_identity(rng)
 
     for page_idx in range(len(writer.pages)):
         page = writer.pages[page_idx]
@@ -1450,6 +1479,7 @@ def anonymize_1042s_pdf(
 
         _process_page_streams(
             page, writer, rng, price_factor, date_shift, replace_names,
+            identity,
         )
 
     with open(output_path, "wb") as f:

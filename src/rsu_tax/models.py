@@ -40,6 +40,21 @@ class ComputedTransaction(SchwabTransaction):
     verification_notes: list[str] = []
 
 
+class LapseEvent(BaseModel):
+    """A single RSU vest/lapse event parsed from Schwab's Lapse History CSV."""
+
+    symbol: str
+    lapse_date: str  # YYYY-MM-DD — the vest/lapse date
+    total_shares: float  # from row 1 Quantity
+    award_date: str | None = None  # YYYY-MM-DD — original grant date
+    award_id: str | None = None
+    fmv_per_share_usd: float  # FairMarketValuePrice — acquisition cost per share
+    sale_price_usd: float  # SalePrice — sell-to-cover price
+    shares_sold_for_taxes: float  # SharesSoldWithheldForTaxes
+    shares_delivered: float  # NetSharesDeposited
+    taxes_usd: float  # Taxes — US tax withheld at vest
+
+
 class VerificationCheck(BaseModel):
     name: str
     status: str                 # "pass" | "warn" | "fail"
