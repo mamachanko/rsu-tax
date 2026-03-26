@@ -17,7 +17,8 @@ from .enrichment import enrich_transactions
 from .exchange_rates import rates_for_dates
 from .export import export_csv, export_markdown, export_pdf
 from .lapse_parser import parse_lapse_csv
-from .models import ComputedTransaction, TaxSummary, VerificationCheck
+from .models import ComputedTransaction, TaxFormData, TaxSummary, VerificationCheck
+from .tax_form_parser import parse_1042s_pdf
 from .verification import run_verification
 
 app = FastAPI(title="RSU Tax Calculator", docs_url=None, redoc_url=None)
@@ -88,6 +89,7 @@ async def upload(
     request: Request,
     file: Annotated[UploadFile, File()],
     lapse_file: Annotated[UploadFile | None, File()] = None,
+    tax_form_file: Annotated[UploadFile | None, File()] = None,
 ) -> HTMLResponse:
     token = request.cookies.get("session", str(uuid.uuid4()))
     session = _get_session(token)
@@ -121,6 +123,22 @@ async def upload(
             transactions = enrichment.transactions
             all_warnings.extend(enrichment.warnings)
 
+    # Parse 1042-S if provided
+    tax_form_data: TaxFormData | None = None
+    if tax_form_file is not None and tax_form_file.filename:
+        import tempfile
+        pdf_content = await tax_form_file.read()
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+            tmp.write(pdf_content)
+            tmp_path = tmp.name
+        try:
+            tax_form_result = parse_1042s_pdf(tmp_path)
+            all_warnings.extend(tax_form_result.warnings)
+            tax_form_data = tax_form_result.data
+        finally:
+            import os
+            os.unlink(tmp_path)
+
     # Collect all dates needed for exchange rates
     all_dates = list({
         d
@@ -143,7 +161,7 @@ async def upload(
         )
 
     computed = compute_capital_gains(transactions, rates)
-    summary = compute_summary(computed)
+    summary = compute_summary(computed, tax_form_data=tax_form_data, rates=rates)
     checks = run_verification(computed, enrichment=enrichment)
 
     # Group transactions by tax year for the year selector
@@ -154,6 +172,7 @@ async def upload(
     session["checks"] = checks
     session["rates"] = rates
     session["warnings"] = all_warnings
+    session["tax_form_data"] = tax_form_data
 
     response = templates.TemplateResponse(
         "partials/results.html",

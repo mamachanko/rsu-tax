@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from .exchange_rates import find_rate_with_date
-from .models import ComputedTransaction, SchwabTransaction, TaxSummary
+from .models import ComputedTransaction, SchwabTransaction, TaxFormData, TaxSummary
 
 _SELL_TO_COVER_TOLERANCE_USD = 1.0
 
@@ -97,6 +97,8 @@ def compute_capital_gains(
 def compute_summary(
     transactions: list[ComputedTransaction],
     tax_year: int | None = None,
+    tax_form_data: TaxFormData | None = None,
+    rates: dict[str, float] | None = None,
 ) -> TaxSummary:
     filtered = (
         [t for t in transactions if t.date_sold.startswith(str(tax_year))]
@@ -113,6 +115,25 @@ def compute_summary(
         or 0
     )
 
+    # 1042-S tax withholding data
+    us_tax_withheld_usd: float | None = None
+    us_tax_withheld_eur: float | None = None
+    withholding_rate: float | None = None
+    gross_vesting_income_usd: float | None = None
+
+    if tax_form_data is not None:
+        us_tax_withheld_usd = tax_form_data.tax_withheld_usd
+        withholding_rate = tax_form_data.withholding_rate
+        gross_vesting_income_usd = tax_form_data.gross_income_usd
+
+        # Convert withheld amount to EUR using an average rate for the year,
+        # or the rate from Dec 31 if available
+        if rates and us_tax_withheld_usd:
+            dec31 = f"{inferred_year}-12-31"
+            rate_result = find_rate_with_date(dec31, rates)
+            if rate_result:
+                us_tax_withheld_eur = _round_cents(us_tax_withheld_usd * rate_result[0])
+
     return TaxSummary(
         tax_year=inferred_year,
         total_transactions=len(filtered),
@@ -126,4 +147,8 @@ def compute_summary(
         total_proceeds_usd=_round_cents(sum(t.proceeds_usd for t in filtered)),
         total_cost_basis_usd=_round_cents(sum(t.cost_basis_usd for t in filtered)),
         net_gain_loss_usd=_round_cents(sum(t.gain_loss_usd for t in filtered)),
+        us_tax_withheld_usd=us_tax_withheld_usd,
+        us_tax_withheld_eur=us_tax_withheld_eur,
+        withholding_rate=withholding_rate,
+        gross_vesting_income_usd=gross_vesting_income_usd,
     )

@@ -61,6 +61,17 @@ class VerificationCheck(BaseModel):
     message: str
 
 
+class TaxFormData(BaseModel):
+    """Parsed data from a 1042-S tax form."""
+
+    tax_year: int
+    gross_income_usd: float       # Box 2: Gross income
+    tax_withheld_usd: float       # Box 7: Federal tax withheld
+    withholding_rate: float       # Box 3b: Tax rate (e.g., 0.30 for 30%)
+    income_code: str | None = None  # Box 1: Income code
+    recipient_country: str | None = None
+
+
 class TaxSummary(BaseModel):
     tax_year: int
     total_transactions: int
@@ -74,6 +85,11 @@ class TaxSummary(BaseModel):
     total_proceeds_usd: float
     total_cost_basis_usd: float
     net_gain_loss_usd: float
+    # Optional: populated when 1042-S is provided
+    us_tax_withheld_usd: float | None = None
+    us_tax_withheld_eur: float | None = None
+    withholding_rate: float | None = None
+    gross_vesting_income_usd: float | None = None
 
 
 class ParseWarning(BaseModel):

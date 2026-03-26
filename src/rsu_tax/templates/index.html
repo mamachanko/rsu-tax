@@ -4,8 +4,8 @@
 <style>
   /* ── Upload zone ───────────────────────────────────────────────────── */
   .upload-section {
-    max-width: 580px;
-    margin: 4rem auto 0;
+    max-width: 620px;
+    margin: 3rem auto 0;
   }
   .upload-section h1 {
     font-size: 1.6rem;
@@ -13,15 +13,80 @@
     letter-spacing: -0.02em;
     margin-bottom: 0.4rem;
   }
-  .upload-section p {
+  .upload-section > p {
     color: var(--text-muted);
-    margin-bottom: 2rem;
+    margin-bottom: 1.5rem;
     font-size: 0.9rem;
+  }
+
+  /* ── File upload slots ─────────────────────────────────────────────── */
+  .file-slot {
+    margin-bottom: 1rem;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 1rem 1.2rem;
+    background: var(--surface);
+    position: relative;
+  }
+  .file-slot.optional {
+    opacity: 0.85;
+  }
+  .file-slot-header {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    margin-bottom: 0.5rem;
+  }
+  .file-slot-header .slot-number {
+    font-family: var(--mono);
+    font-size: 0.7rem;
+    font-weight: 700;
+    color: var(--accent);
+    background: rgba(108,140,255,.12);
+    border-radius: 50%;
+    width: 1.5rem;
+    height: 1.5rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+  }
+  .file-slot-header h3 {
+    font-size: 0.88rem;
+    font-weight: 600;
+    flex: 1;
+    margin: 0;
+  }
+  .file-slot-header .slot-badge {
+    font-size: 0.65rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    padding: 0.15em 0.5em;
+    border-radius: 3px;
+    flex-shrink: 0;
+  }
+  .slot-badge.required {
+    background: rgba(62,207,142,.15);
+    color: var(--success);
+  }
+  .slot-badge.recommended {
+    background: rgba(108,140,255,.12);
+    color: var(--accent);
+  }
+  .slot-badge.optional-badge {
+    background: rgba(255,255,255,.08);
+    color: var(--text-muted);
+  }
+  .file-slot-desc {
+    font-size: 0.78rem;
+    color: var(--text-muted);
+    margin-bottom: 0.6rem;
   }
   .drop-zone {
     border: 2px dashed var(--border);
     border-radius: var(--radius);
-    padding: 3rem 2rem;
+    padding: 1.5rem 1rem;
     text-align: center;
     cursor: pointer;
     transition: border-color .2s, background .2s;
@@ -32,13 +97,14 @@
   .drop-zone input[type="file"] {
     position: absolute; inset: 0; opacity: 0; cursor: pointer;
   }
-  .drop-zone .icon { font-size: 2rem; margin-bottom: 0.75rem; color: var(--text-muted); }
+  .drop-zone .icon { font-size: 1.3rem; margin-bottom: 0.4rem; color: var(--text-muted); }
   .drop-zone .primary-text {
     font-weight: 600;
-    margin-bottom: 0.3rem;
+    font-size: 0.82rem;
+    margin-bottom: 0.15rem;
   }
   .drop-zone .secondary-text {
-    font-size: 0.8rem;
+    font-size: 0.72rem;
     color: var(--text-muted);
   }
   /* ── File chip (replaces drop zone after selection) ────────────── */
@@ -46,23 +112,23 @@
     display: none;
     align-items: center;
     gap: 0.6rem;
-    padding: 0.7rem 1rem;
-    background: var(--surface);
+    padding: 0.55rem 0.8rem;
+    background: var(--bg);
     border: 1px solid var(--border);
     border-radius: var(--radius);
   }
-  .file-chip .chip-icon { font-size: 1.2rem; flex-shrink: 0; }
+  .file-chip .chip-icon { font-size: 1rem; flex-shrink: 0; }
   .file-chip .chip-name {
     flex: 1;
     font-family: var(--mono);
-    font-size: 0.82rem;
+    font-size: 0.78rem;
     color: var(--accent);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
   }
   .file-chip .chip-change {
-    font-size: 0.78rem;
+    font-size: 0.72rem;
     color: var(--text-muted);
     cursor: pointer;
     flex-shrink: 0;
@@ -175,7 +241,6 @@
     border-radius: var(--radius);
     font: inherit;
     padding: 0.45em 0.9em;
-    margin-top: 0.5rem;
     transition: background .15s, border-color .15s;
   }
   .info-link:hover { background: rgba(108,140,255,.15); border-color: rgba(108,140,255,.4); }
@@ -201,9 +266,9 @@
 {% block content %}
 <div class="upload-section" id="upload-section">
   <h1>RSU Tax Calculator</h1>
-  <p>Import your Schwab Realized Gain/Loss CSV and get EUR capital gains for your German tax return in seconds.</p>
+  <p>Import your Schwab data for EUR capital gains calculation (Abgeltungssteuer).</p>
   <div style="margin-bottom:1.5rem">
-    <button type="button" class="info-link" onclick="document.getElementById('info-overlay').classList.add('open')">How do I get this data?</button>
+    <button type="button" class="info-link" onclick="document.getElementById('info-overlay').classList.add('open')">How do I get these files?</button>
   </div>
 
   <form
@@ -214,22 +279,67 @@
     hx-encoding="multipart/form-data"
     hx-indicator="#upload-spinner"
   >
-    <div class="drop-zone" id="drop-zone">
-      <input
-        type="file"
-        name="file"
-        id="file-input"
-        accept=".csv,text/csv"
-        required
-      />
-      <div class="icon">📄</div>
-      <div class="primary-text">Drop your CSV file here</div>
-      <div class="secondary-text">or click to browse · Schwab Realized Gain/Loss format</div>
+    {# ── File 1: Realized Gain/Loss (Required) ─────────────────────── #}
+    <div class="file-slot">
+      <div class="file-slot-header">
+        <span class="slot-number">1</span>
+        <h3>Realized Gain/Loss CSV</h3>
+        <span class="slot-badge required">Required</span>
+      </div>
+      <div class="file-slot-desc">Your main transaction data from Schwab EAC</div>
+      <div class="drop-zone" id="drop-zone-main">
+        <input type="file" name="file" id="file-input" accept=".csv,text/csv" required />
+        <div class="icon">📄</div>
+        <div class="primary-text">Drop CSV here or click to browse</div>
+        <div class="secondary-text">Schwab Realized Gain/Loss export</div>
+      </div>
+      <div class="file-chip" id="file-chip-main">
+        <span class="chip-icon">📄</span>
+        <span class="chip-name" id="chip-name-main"></span>
+        <a class="chip-change" data-slot="main">change</a>
+      </div>
     </div>
-    <div class="file-chip" id="file-chip">
-      <span class="chip-icon">📄</span>
-      <span class="chip-name" id="chip-name"></span>
-      <a class="chip-change" id="chip-change">change</a>
+
+    {# ── File 2: Lapse History (Recommended) ───────────────────────── #}
+    <div class="file-slot optional">
+      <div class="file-slot-header">
+        <span class="slot-number">2</span>
+        <h3>Lapse History CSV</h3>
+        <span class="slot-badge recommended">Recommended</span>
+      </div>
+      <div class="file-slot-desc">Vest dates & FMV per share for correct EUR conversion</div>
+      <div class="drop-zone" id="drop-zone-lapse">
+        <input type="file" name="lapse_file" id="file-input-lapse" accept=".csv,text/csv" />
+        <div class="icon">📄</div>
+        <div class="primary-text">Drop CSV here or click to browse</div>
+        <div class="secondary-text">EAC transaction history filtered by "Lapse"</div>
+      </div>
+      <div class="file-chip" id="file-chip-lapse">
+        <span class="chip-icon">📄</span>
+        <span class="chip-name" id="chip-name-lapse"></span>
+        <a class="chip-change" data-slot="lapse">change</a>
+      </div>
+    </div>
+
+    {# ── File 3: 1042-S Tax Form (Optional) ────────────────────────── #}
+    <div class="file-slot optional">
+      <div class="file-slot-header">
+        <span class="slot-number">3</span>
+        <h3>1042-S Tax Form</h3>
+        <span class="slot-badge optional-badge">Optional</span>
+      </div>
+      <div class="file-slot-desc">US tax withheld for foreign tax credit (Anlage AUS)</div>
+      <div class="drop-zone" id="drop-zone-tax">
+        <input type="file" name="tax_form_file" id="file-input-tax" accept=".pdf,application/pdf" />
+        <div class="icon">📑</div>
+        <div class="primary-text">Drop PDF here or click to browse</div>
+        <div class="secondary-text">IRS Form 1042-S from Schwab</div>
+      </div>
+      <div class="file-chip" id="file-chip-tax">
+        <span class="chip-icon">📑</span>
+        <span class="chip-name" id="chip-name-tax"></span>
+        <a class="chip-change" data-slot="tax">change</a>
+      </div>
     </div>
 
     <div class="upload-actions">
@@ -255,11 +365,11 @@
     </div>
     <div class="feature">
       <div class="label">Verification</div>
-      7 data quality checks on every import
+      Data quality checks on every import
     </div>
     <div class="feature">
       <div class="label">Privacy</div>
-      All processing happens locally — nothing leaves your machine
+      All processing happens locally &mdash; nothing leaves your machine
     </div>
   </div>
 </div>
@@ -269,47 +379,52 @@
   <div class="info-backdrop" onclick="document.getElementById('info-overlay').classList.remove('open')"></div>
   <div class="info-panel">
     <button type="button" class="close-btn" onclick="document.getElementById('info-overlay').classList.remove('open')">&times;</button>
-    <h2>How to Get Your Data from Schwab</h2>
+    <h2>Your Schwab Files</h2>
+
+    <p style="font-size:0.82rem;color:var(--text-muted);margin-bottom:1.25rem">
+      You'll download up to 3 files from Schwab. Here's where to find each one.
+    </p>
 
     <div class="info-step" data-step="1">
-      <h3>Find your vesting date &amp; FMV per share</h3>
+      <h3>Realized Gain/Loss (Required)</h3>
+      <p>Your main transaction data &mdash; every lot you sold.</p>
       <ul>
         <li>Log in to <a href="https://eac.schwab.com" target="_blank" rel="noopener">Equity Award Center</a></li>
-        <li>Navigate to <code>History</code> &rarr; <code>Transactions</code> &rarr; filter by <code>Vest</code></li>
-        <li>Each vesting event shows: vest date, shares delivered, and FMV per share on the vest date (USD)</li>
-        <li>This FMV is your <strong style="color:var(--text)">USD cost basis per share</strong></li>
+        <li>Click <code>Realized Gain/Loss</code> in the left sidebar</li>
+        <li>Set the date range to cover your tax year</li>
+        <li>Click <code>Export</code> (top right) &rarr; CSV</li>
       </ul>
     </div>
 
     <div class="info-step" data-step="2">
-      <h3>Find your sale date &amp; sale price</h3>
+      <h3>Lapse History (Recommended)</h3>
+      <p>Gives us vest dates and FMV per share &mdash; so we convert cost basis at the correct EUR rate.</p>
       <ul>
-        <li>In the same Equity Award Center &rarr; <code>History</code> &rarr; filter by <code>Sale</code></li>
-        <li>Each sale shows: sale date, shares sold, and gross proceeds per share (USD)</li>
+        <li>In Equity Award Center, go to your transaction history</li>
+        <li>Filter by transaction type: <code>Lapse</code></li>
+        <li>Set date range to cover your tax year</li>
+        <li>Click <code>Export</code> &rarr; CSV</li>
       </ul>
     </div>
 
     <div class="info-step" data-step="3">
-      <h3>Download your tax form &amp; export CSV</h3>
+      <h3>1042-S Tax Form (Optional)</h3>
+      <p>If you want to claim a foreign tax credit on your German return (Anlage AUS).</p>
       <ul>
-        <li>In Schwab: <code>Statements</code> &rarr; <code>Account</code> dropdown &rarr; select <code>Equity Award Center</code> &rarr; enable <code>Tax Forms</code> filter</li>
-        <li><strong style="color:var(--text)">US tax residents</strong> receive a <strong style="color:var(--text)">1099-B</strong> — reports lot-level sale proceeds, cost basis, and gain/loss (USD)</li>
-        <li><strong style="color:var(--text)">Non-US persons</strong> (e.g. German tax residents) typically receive a <strong style="color:var(--text)">1042-S</strong> instead — reports US-source income from RSU vesting and any US tax withheld (usually 30%, or a reduced treaty rate)</li>
-        <li>Regardless of which tax form you receive, navigate to <code>Realized Gain/Loss</code> and export the <strong style="color:var(--text)">CSV</strong> for upload here</li>
+        <li>On schwab.com, go to <code>Accounts</code> &rarr; <code>Statements</code></li>
+        <li>Click <code>Tax Forms</code> tab</li>
+        <li>Find your 1042-S for the relevant tax year</li>
+        <li>Download PDF</li>
       </ul>
-      <p style="margin-top:0.4rem;color:var(--warn);font-size:0.78rem">
-        <strong>1042-S vs 1099-B:</strong> The 1042-S covers the withholding on your RSU vesting income, while sale-level data (proceeds, cost basis) comes from the Realized Gain/Loss report. Both US and non-US persons use the same CSV export for this calculator.
-      </p>
     </div>
 
-    <div class="info-step" data-step="4">
-      <h3>ECB EUR/USD exchange rates</h3>
-      <p>This tool fetches ECB reference rates automatically. If you want to verify them manually:</p>
-      <ul>
-        <li><a href="https://www.bundesbank.de/en/statistics/exchange-rates" target="_blank" rel="noopener">Bundesbank</a> &rarr; Statistics &rarr; Exchange Rates &rarr; Euro foreign exchange reference rates</li>
-        <li><a href="https://sdw.ecb.europa.eu" target="_blank" rel="noopener">ECB Statistical Data Warehouse</a></li>
-        <li>Look up the USD/EUR rate for each vesting date and each sale date</li>
-      </ul>
+    <div style="margin-top:1rem;padding:0.8rem;background:var(--bg);border-radius:var(--radius);font-size:0.8rem;">
+      <strong style="color:var(--text)">After these steps you should have:</strong>
+      <div style="margin-top:0.5rem;font-family:var(--mono);font-size:0.75rem;color:var(--text-muted)">
+        <div style="margin-bottom:0.2rem"><span style="color:var(--success)">&#x2713;</span> realized-gain-loss.csv <span style="float:right;color:var(--success)">REQUIRED</span></div>
+        <div style="margin-bottom:0.2rem"><span style="color:var(--accent)">&#x2713;</span> lapse-history.csv <span style="float:right;color:var(--accent)">RECOMMENDED</span></div>
+        <div><span style="color:var(--text-muted)">&#x25CB;</span> 1042-S.pdf <span style="float:right;color:var(--text-muted)">OPTIONAL</span></div>
+      </div>
     </div>
 
     <div style="margin-top:1rem; padding-top:1rem; border-top:1px solid var(--border); font-size:0.8rem; color:var(--text-muted);">
@@ -321,61 +436,80 @@
 <div id="results" class="mt-4"></div>
 
 <script>
-  const input    = document.getElementById("file-input");
-  const zone     = document.getElementById("drop-zone");
-  const chip     = document.getElementById("file-chip");
-  const chipName = document.getElementById("chip-name");
-  const chipChg  = document.getElementById("chip-change");
-  const btn      = document.getElementById("upload-btn");
+  // ── File slot management ──────────────────────────────────────────
+  const slots = {
+    main:  { zone: 'drop-zone-main',  chip: 'file-chip-main',  name: 'chip-name-main',  input: 'file-input' },
+    lapse: { zone: 'drop-zone-lapse', chip: 'file-chip-lapse', name: 'chip-name-lapse', input: 'file-input-lapse' },
+    tax:   { zone: 'drop-zone-tax',   chip: 'file-chip-tax',   name: 'chip-name-tax',   input: 'file-input-tax' },
+  };
 
-  function showChip(name) {
-    zone.style.display = "none";
-    chipName.textContent = name;
-    chip.style.display = "flex";
-    btn.disabled = false;
+  function showChip(slot, fileName) {
+    const s = slots[slot];
+    document.getElementById(s.zone).style.display = 'none';
+    document.getElementById(s.name).textContent = fileName;
+    document.getElementById(s.chip).style.display = 'flex';
+    updateSubmitButton();
   }
 
-  function showZone() {
-    chip.style.display = "none";
-    zone.style.display = "";
-    input.value = "";
-    btn.disabled = true;
+  function showZone(slot) {
+    const s = slots[slot];
+    document.getElementById(s.chip).style.display = 'none';
+    document.getElementById(s.zone).style.display = '';
+    document.getElementById(s.input).value = '';
+    updateSubmitButton();
   }
 
-  chipChg.addEventListener("click", showZone);
+  function updateSubmitButton() {
+    const mainInput = document.getElementById('file-input');
+    document.getElementById('upload-btn').disabled = !mainInput.files.length;
+  }
 
-  input.addEventListener("change", () => {
-    if (input.files[0]) showChip(input.files[0].name);
+  // Wire up all file inputs
+  for (const [slot, ids] of Object.entries(slots)) {
+    const input = document.getElementById(ids.input);
+    input.addEventListener('change', () => {
+      if (input.files[0]) showChip(slot, input.files[0].name);
+    });
+  }
+
+  // Wire up all "change" links
+  document.querySelectorAll('.chip-change').forEach(el => {
+    el.addEventListener('click', () => showZone(el.dataset.slot));
   });
 
-  ["dragenter","dragover"].forEach(e => zone.addEventListener(e, ev => {
-    ev.preventDefault(); zone.classList.add("dragover");
-  }));
-  ["dragleave","drop"].forEach(e => zone.addEventListener(e, ev => {
-    ev.preventDefault(); zone.classList.remove("dragover");
-  }));
-  zone.addEventListener("drop", ev => {
-    const f = ev.dataTransfer?.files[0];
-    if (f) { input.files = ev.dataTransfer.files; showChip(f.name); }
-  });
+  // Drag-and-drop for all drop zones
+  for (const [slot, ids] of Object.entries(slots)) {
+    const zone = document.getElementById(ids.zone);
+    const input = document.getElementById(ids.input);
+    ['dragenter','dragover'].forEach(e => zone.addEventListener(e, ev => {
+      ev.preventDefault(); zone.classList.add('dragover');
+    }));
+    ['dragleave','drop'].forEach(e => zone.addEventListener(e, ev => {
+      ev.preventDefault(); zone.classList.remove('dragover');
+    }));
+    zone.addEventListener('drop', ev => {
+      const f = ev.dataTransfer?.files[0];
+      if (f) { input.files = ev.dataTransfer.files; showChip(slot, f.name); }
+    });
+  }
 
   // Close info overlay on Escape
-  document.addEventListener("keydown", ev => {
-    if (ev.key === "Escape") document.getElementById("info-overlay").classList.remove("open");
+  document.addEventListener('keydown', ev => {
+    if (ev.key === 'Escape') document.getElementById('info-overlay').classList.remove('open');
   });
 
-  // Hide upload section when results arrive; restore drop zone for re-use
-  document.body.addEventListener("htmx:afterSettle", ev => {
-    if (ev.detail.target.id === "results" && ev.detail.target.innerHTML.trim()) {
-      document.getElementById("upload-section").style.display = "none";
-      showZone();
+  // Hide upload section when results arrive; restore drop zones for re-use
+  document.body.addEventListener('htmx:afterSettle', ev => {
+    if (ev.detail.target.id === 'results' && ev.detail.target.innerHTML.trim()) {
+      document.getElementById('upload-section').style.display = 'none';
+      for (const slot of Object.keys(slots)) showZone(slot);
     }
   });
 
   // Called by the toggle button rendered inside the results partial
   window.toggleUploadSection = function() {
-    const sec = document.getElementById("upload-section");
-    sec.style.display = sec.style.display === "none" ? "" : "none";
+    const sec = document.getElementById('upload-section');
+    sec.style.display = sec.style.display === 'none' ? '' : 'none';
   };
 </script>
 {% endblock %}

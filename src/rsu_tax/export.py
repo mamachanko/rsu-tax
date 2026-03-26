@@ -133,6 +133,15 @@ def export_pdf(
         ("Total cost basis (EUR)", f"{summary.total_cost_basis_eur:,.2f} EUR"),
         ("Net gain/loss (USD)", f"{summary.net_gain_loss_usd:,.2f} USD"),
     ]
+    if summary.us_tax_withheld_usd is not None:
+        rows.append(("", ""))
+        rows.append(("US Tax Withheld (USD)", f"{summary.us_tax_withheld_usd:,.2f} USD"))
+        if summary.us_tax_withheld_eur is not None:
+            rows.append(("US Tax Withheld (EUR)", f"{summary.us_tax_withheld_eur:,.2f} EUR"))
+        if summary.withholding_rate is not None:
+            rows.append(("Withholding Rate", f"{summary.withholding_rate:.0%}"))
+        if summary.gross_vesting_income_usd is not None:
+            rows.append(("Gross Vesting Income (USD)", f"{summary.gross_vesting_income_usd:,.2f} USD"))
     col_w = [80, 60]
     for label, val in rows:
         pdf.cell(col_w[0], 6, label)
@@ -331,6 +340,30 @@ def export_markdown(
         f"| — from Voluntary Sales (EUR) | {summary.voluntary_gain_loss_eur:,.2f} EUR |",
         f"| — from Sell-to-Cover (EUR) | {summary.sell_to_cover_gain_loss_eur:,.2f} EUR |",
         f"| Net Gain/Loss (USD) | {summary.net_gain_loss_usd:,.2f} USD |",
+    ]
+
+    if summary.us_tax_withheld_usd is not None:
+        lines += [
+            "",
+            "### US Tax Withholding (from 1042-S)",
+            "",
+            "| Field | Value |",
+            "|-------|------:|",
+            f"| US Tax Withheld (USD) | {summary.us_tax_withheld_usd:,.2f} USD |",
+        ]
+        if summary.us_tax_withheld_eur is not None:
+            lines.append(f"| US Tax Withheld (EUR) | {summary.us_tax_withheld_eur:,.2f} EUR |")
+        if summary.withholding_rate is not None:
+            lines.append(f"| Withholding Rate | {summary.withholding_rate:.0%} |")
+        if summary.gross_vesting_income_usd is not None:
+            lines.append(f"| Gross Vesting Income (USD) | {summary.gross_vesting_income_usd:,.2f} USD |")
+        lines += [
+            "",
+            "> **For Anlage AUS:** The US tax withheld amount (EUR) can be claimed as a "
+            "foreign tax credit on your German tax return.",
+        ]
+
+    lines += [
         "",
         "---",
         "",
@@ -455,6 +488,22 @@ def export_markdown(
         "**and** the gain/loss is within $1.00 of zero.",
         "",
         "All other transactions are classified as *Voluntary Sales*.",
+        "",
+        "---",
+        "",
+        "## Data Sources",
+        "",
+        "| File | Status |",
+        "|------|--------|",
+        "| Realized Gain/Loss CSV | Imported |",
+    ]
+    # Check if lapse data was used (indicated by transactions having enriched dates)
+    has_lapse = any(t.has_acquisition_date for t in transactions)
+    lines.append(f"| Lapse History CSV | {'Imported' if has_lapse else 'Not provided'} |")
+    lines.append(
+        f"| 1042-S Tax Form | {'Imported' if summary.us_tax_withheld_usd is not None else 'Not provided'} |"
+    )
+    lines += [
         "",
         "---",
         "",

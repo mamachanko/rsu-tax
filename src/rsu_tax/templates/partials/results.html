@@ -196,6 +196,13 @@
     <div class="metric-value">{{ summary.total_transactions }}</div>
     <div class="metric-sub">Tax year {{ summary.tax_year }}</div>
   </div>
+  {% if summary.us_tax_withheld_usd is not none %}
+  <div class="metric-card">
+    <div class="metric-label">US Tax Withheld</div>
+    <div class="metric-value">{{ summary.us_tax_withheld_eur | fmt_eur }}</div>
+    <div class="metric-sub">{{ summary.us_tax_withheld_usd | fmt_usd }}{% if summary.withholding_rate %} ({{ "%.0f"|format(summary.withholding_rate * 100) }}%){% endif %}</div>
+  </div>
+  {% endif %}
 </div>
 
 {# ── Verification checks ─────────────────────────────────────────────── #}
