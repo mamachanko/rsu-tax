@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+from .enrichment import EnrichmentResult
 from .models import ComputedTransaction, VerificationCheck
 
 _RATE_MIN = 0.60
 _RATE_MAX = 1.15
 
 
-def run_verification(transactions: list[ComputedTransaction]) -> list[VerificationCheck]:
-    """Run all 7 verification checks and return a list of results."""
+def run_verification(
+    transactions: list[ComputedTransaction],
+    enrichment: EnrichmentResult | None = None,
+) -> list[VerificationCheck]:
+    """Run verification checks and return a list of results."""
     if not transactions:
         return []
 
@@ -145,5 +149,36 @@ def run_verification(transactions: list[ComputedTransaction]) -> list[Verificati
             status="pass",
             message=f"USD totals cross-check passed ({usd_sum:.2f} $).",
         ))
+
+    # 8. Lapse data enrichment (only when lapse file was provided)
+    if enrichment is not None:
+        total_enrichable = enrichment.matched + enrichment.unmatched
+        if enrichment.matched > 0 and enrichment.unmatched == 0:
+            checks.append(VerificationCheck(
+                name="Lapse Data Enrichment",
+                status="pass",
+                message=(
+                    f"All {enrichment.matched} transaction(s) matched to lapse events. "
+                    f"Vest dates used for cost basis EUR conversion."
+                ),
+            ))
+        elif enrichment.matched > 0 and enrichment.unmatched > 0:
+            checks.append(VerificationCheck(
+                name="Lapse Data Enrichment",
+                status="warn",
+                message=(
+                    f"{enrichment.matched} of {total_enrichable} transaction(s) matched "
+                    f"to lapse events. {enrichment.unmatched} still missing acquisition dates."
+                ),
+            ))
+        else:
+            checks.append(VerificationCheck(
+                name="Lapse Data Enrichment",
+                status="warn",
+                message=(
+                    f"Lapse file provided but no transactions could be matched. "
+                    f"Check that symbols match between files."
+                ),
+            ))
 
     return checks

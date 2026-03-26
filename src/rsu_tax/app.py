@@ -13,8 +13,10 @@ from fastapi.templating import Jinja2Templates
 
 from .calculator import compute_capital_gains, compute_summary
 from .csv_parser import parse_schwab_csv
+from .enrichment import enrich_transactions
 from .exchange_rates import rates_for_dates
 from .export import export_csv, export_markdown, export_pdf
+from .lapse_parser import parse_lapse_csv
 from .models import ComputedTransaction, TaxSummary, VerificationCheck
 from .verification import run_verification
 
@@ -72,21 +74,27 @@ async def index(request: Request) -> HTMLResponse:
     return response
 
 
+async def _decode_upload(upload: UploadFile) -> str:
+    """Read and decode an uploaded file as text."""
+    content = await upload.read()
+    try:
+        return content.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return content.decode("latin-1")
+
+
 @app.post("/upload", response_class=HTMLResponse)
 async def upload(
     request: Request,
     file: Annotated[UploadFile, File()],
+    lapse_file: Annotated[UploadFile | None, File()] = None,
 ) -> HTMLResponse:
     token = request.cookies.get("session", str(uuid.uuid4()))
     session = _get_session(token)
 
-    content = await file.read()
-    try:
-        csv_text = content.decode("utf-8-sig")  # handle BOM
-    except UnicodeDecodeError:
-        csv_text = content.decode("latin-1")
-
+    csv_text = await _decode_upload(file)
     parse_result = parse_schwab_csv(csv_text)
+    all_warnings = list(parse_result.warnings)
 
     if not parse_result.transactions:
         return templates.TemplateResponse(
@@ -94,15 +102,29 @@ async def upload(
             {
                 "request": request,
                 "message": "No transactions found in the uploaded file.",
-                "warnings": parse_result.warnings,
+                "warnings": all_warnings,
             },
             status_code=422,
         )
 
+    transactions = parse_result.transactions
+    enrichment = None
+
+    # Enrich with lapse data if provided
+    if lapse_file is not None and lapse_file.filename:
+        lapse_text = await _decode_upload(lapse_file)
+        lapse_result = parse_lapse_csv(lapse_text)
+        all_warnings.extend(lapse_result.warnings)
+
+        if lapse_result.events:
+            enrichment = enrich_transactions(transactions, lapse_result.events)
+            transactions = enrichment.transactions
+            all_warnings.extend(enrichment.warnings)
+
     # Collect all dates needed for exchange rates
     all_dates = list({
         d
-        for t in parse_result.transactions
+        for t in transactions
         for d in (t.date_sold, t.date_acquired)
         if d
     })
@@ -120,9 +142,9 @@ async def upload(
             status_code=502,
         )
 
-    computed = compute_capital_gains(parse_result.transactions, rates)
+    computed = compute_capital_gains(transactions, rates)
     summary = compute_summary(computed)
-    checks = run_verification(computed)
+    checks = run_verification(computed, enrichment=enrichment)
 
     # Group transactions by tax year for the year selector
     years = sorted({int(t.date_sold[:4]) for t in computed}, reverse=True)
@@ -131,7 +153,7 @@ async def upload(
     session["summary"] = summary
     session["checks"] = checks
     session["rates"] = rates
-    session["warnings"] = parse_result.warnings
+    session["warnings"] = all_warnings
 
     response = templates.TemplateResponse(
         "partials/results.html",
@@ -140,7 +162,7 @@ async def upload(
             "computed": computed,
             "summary": summary,
             "checks": checks,
-            "warnings": parse_result.warnings,
+            "warnings": all_warnings,
             "years": years,
             "selected_year": summary.tax_year,
         },

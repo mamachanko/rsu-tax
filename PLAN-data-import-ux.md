@@ -391,9 +391,9 @@ A CLI tool that takes real Schwab files and produces randomized versions safe fo
 | **Phase 0b** | Add Lapse CSV anonymizer (two-row structure) | ✅ Done |
 | **Phase 1** | Frontend: multi-file upload UX + updated info dialog | Pending |
 | **Phase 2** | Lapse history parser + `LapseEvent` model | ✅ Done |
-| **Phase 3** | Data enrichment: merge lapse data into calculation pipeline | Pending |
+| **Phase 3** | Data enrichment: merge lapse data into calculation pipeline | ✅ Done |
 | **Phase 4** | 1042-S PDF parsing + tax withholding integration | Pending |
-| **Phase 5** | Updated verification checks | Pending |
+| **Phase 5** | Updated verification checks | ✅ Done (lapse enrichment check added) |
 | **Phase 6** | Export enhancements (CSV, PDF, Markdown) | Pending |
 | **Phase 7** | Tests for all new parsers and enrichment logic | Pending |
 
