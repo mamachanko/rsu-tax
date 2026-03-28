@@ -142,16 +142,27 @@ def enrich_transactions(
                 unmatched_missing_date += 1
             enriched.append(tx)
 
-    if unmatched_missing_date > 0:
-        warnings.append(
-            f"{unmatched_missing_date} transaction(s) still missing acquisition date "
-            f"after lapse matching (lapse file may not cover all vest dates)"
-        )
-
     if matched > 0:
         warnings.append(
-            f"Enriched {matched} transaction(s) with lapse data "
-            f"(vest dates filled in for EUR conversion)"
+            f"Enriched {matched} transaction(s) with lapse data — "
+            f"vest dates filled in for accurate EUR cost basis conversion."
+        )
+
+    if unmatched_missing_date > 0:
+        # Collect available FMVs and unmatched per-share costs for diagnostics
+        available_fmvs = sorted({e.fmv_per_share_usd for e in lapse_events})
+        unmatched_per_share = sorted({
+            round(tx.cost_basis_usd / tx.quantity, 2)
+            for tx in enriched
+            if not tx.has_acquisition_date and tx.quantity > 0
+        })
+        fmv_str = ", ".join(f"${v:.2f}" for v in available_fmvs)
+        cost_str = ", ".join(f"${v:.2f}" for v in unmatched_per_share[:5])
+        warnings.append(
+            f"{unmatched_missing_date} transaction(s) still missing acquisition date. "
+            f"Their per-share cost ({cost_str}) doesn't match any vest FMV "
+            f"in the lapse file ({fmv_str}). These shares may be from older "
+            f"vests — try exporting lapse history with a wider date range."
         )
 
     return EnrichmentResult(

@@ -247,9 +247,11 @@ def parse_1042s_pdf(pdf_path: str) -> TaxFormParseResult:
         expected = gross_income * withholding_rate
         if abs(expected - tax_withheld) > max(1.0, gross_income * 0.02):
             warnings.append(
-                f"Tax withheld ({tax_withheld:.2f}) doesn't match "
-                f"gross income ({gross_income:.2f}) x rate ({withholding_rate:.0%}) "
-                f"= {expected:.2f}"
+                f"Note: Tax withheld (${tax_withheld:,.2f}) differs from "
+                f"gross income (${gross_income:,.2f}) × rate ({withholding_rate:.0%}) "
+                f"= ${expected:,.2f}. This can happen when withholding applies "
+                f"to only part of the income (e.g. treaty-exempt portion). "
+                f"The parsed values will be used as-is."
             )
 
     data = TaxFormData(

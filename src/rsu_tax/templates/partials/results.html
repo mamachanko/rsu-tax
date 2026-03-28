@@ -101,6 +101,8 @@
   }
   .warnings ul { padding-left: 1.2em; margin-top: 0.4rem; }
   .warnings li { color: var(--warn); margin-bottom: 0.25rem; }
+  .warnings li.info { color: var(--pass, #4caf50); }
+  .warnings li.note { color: var(--text-muted, #888); }
   .warnings strong { color: var(--warn); }
 
   /* ── Action bar ──────────────────────────────────────────────────── */
@@ -155,7 +157,9 @@
 <div class="warnings">
   <strong>⚠ Import warnings</strong>
   <ul>
-    {% for w in warnings %}<li>{{ w }}</li>{% endfor %}
+    {% for w in warnings %}
+    <li class="{% if w.startswith('Enriched') %}info{% elif w.startswith('Note:') %}note{% endif %}">{{ w }}</li>
+    {% endfor %}
   </ul>
 </div>
 {% endif %}
