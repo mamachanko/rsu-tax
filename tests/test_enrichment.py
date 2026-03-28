@@ -120,6 +120,32 @@ class TestMultipleTransactions:
         assert result.transactions[0].date_acquired == "2025-03-15"
         assert result.transactions[1].date_acquired == "2025-03-15"
 
+    def test_different_quantities_same_per_share_cost(self) -> None:
+        """Lots split differently from the lapse should still match via per-share FMV."""
+        fmv = 321.43
+        # Lapse event: 144 total shares
+        lapse = _make_lapse(total_shares=144, fmv_per_share_usd=fmv,
+                            shares_sold_for_taxes=69, shares_delivered=75)
+        # Sell lots with arbitrary quantities (not matching lapse totals)
+        tx1 = _make_tx(quantity=73.0, cost_basis_usd=fmv * 73, has_acquisition_date=False)
+        tx2 = _make_tx(quantity=30.0, cost_basis_usd=fmv * 30, has_acquisition_date=False)
+
+        result = enrich_transactions([tx1, tx2], [lapse])
+        assert result.matched == 2
+
+    def test_multiple_vest_dates_matched_correctly(self) -> None:
+        """Transactions from different vests match the correct lapse event."""
+        lapse1 = _make_lapse(lapse_date="2025-03-15", fmv_per_share_usd=321.43)
+        lapse2 = _make_lapse(lapse_date="2025-12-31", fmv_per_share_usd=336.11)
+
+        tx1 = _make_tx(quantity=50, cost_basis_usd=321.43 * 50, has_acquisition_date=False)
+        tx2 = _make_tx(quantity=50, cost_basis_usd=336.11 * 50, has_acquisition_date=False)
+
+        result = enrich_transactions([tx1, tx2], [lapse1, lapse2])
+        assert result.matched == 2
+        assert result.transactions[0].date_acquired == "2025-03-15"
+        assert result.transactions[1].date_acquired == "2025-12-31"
+
     def test_tx_with_existing_acq_date_preserved(self) -> None:
         """Transaction that already has an acquisition date keeps it."""
         tx = _make_tx(

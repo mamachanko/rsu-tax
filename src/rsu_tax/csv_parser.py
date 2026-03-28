@@ -211,8 +211,8 @@ def parse_schwab_csv(csv_text: str) -> ParseResult:
     has_acquisition_date = mapping["date_acquired"] != _NONE_SENTINEL
     if not has_acquisition_date:
         warnings.append(
-            "No \"Date Acquired\" column found. "
-            "Using sale date for cost-basis exchange rate conversion."
+            "No \"Date Acquired\" column found in Realized Gain/Loss CSV. "
+            "Upload the Lapse History CSV to fill in vest dates automatically."
         )
 
     transactions: list[SchwabTransaction] = []

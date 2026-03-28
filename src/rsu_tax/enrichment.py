@@ -11,9 +11,9 @@ from dataclasses import dataclass, field
 
 from .models import LapseEvent, SchwabTransaction
 
-# Tolerance for matching cost basis: FMV × quantity vs CSV cost_basis_usd
-_COST_BASIS_TOLERANCE_PCT = 0.02  # 2%
-_COST_BASIS_TOLERANCE_ABS = 5.0   # $5 absolute
+# Tolerance for matching per-share cost basis against FMV per share
+_PER_SHARE_TOLERANCE_PCT = 0.03  # 3%
+_PER_SHARE_TOLERANCE_ABS = 2.0   # $2 absolute per share
 
 
 @dataclass
@@ -24,18 +24,22 @@ class EnrichmentResult:
     warnings: list[str] = field(default_factory=list)
 
 
-def _cost_basis_matches(
+def _per_share_matches(
     tx_cost_basis: float,
+    tx_quantity: float,
     fmv_per_share: float,
-    quantity: float,
 ) -> bool:
-    """Check if a transaction's cost basis ≈ FMV × quantity."""
-    expected = fmv_per_share * quantity
-    if expected == 0:
+    """Check if a transaction's per-share cost basis matches a lapse FMV.
+
+    Compares cost_basis/quantity against fmv_per_share. This is more robust
+    than comparing totals because it's independent of lot splitting.
+    """
+    if tx_quantity == 0 or fmv_per_share == 0:
         return False
-    diff = abs(tx_cost_basis - expected)
-    pct = diff / expected
-    return pct <= _COST_BASIS_TOLERANCE_PCT or diff <= _COST_BASIS_TOLERANCE_ABS
+    per_share_cost = tx_cost_basis / tx_quantity
+    diff = abs(per_share_cost - fmv_per_share)
+    pct = diff / fmv_per_share
+    return pct <= _PER_SHARE_TOLERANCE_PCT or diff <= _PER_SHARE_TOLERANCE_ABS
 
 
 def _build_lapse_index(
@@ -51,34 +55,39 @@ def _build_lapse_index(
 def _find_matching_lapse(
     tx: SchwabTransaction,
     candidates: list[LapseEvent],
-    used: set[tuple[str, str, str]],
 ) -> LapseEvent | None:
     """Find the best matching lapse event for a transaction.
 
-    Matching strategy:
-    1. If tx has acquisition date: match by symbol + date_acquired == lapse_date
-    2. If tx has no acquisition date: match by symbol + cost_basis ≈ FMV × quantity
+    Matching strategy — compare per-share cost basis against each lapse
+    event's FMV per share.  Multiple lots from the same vest all share the
+    same per-share cost, so this is independent of quantity splits.
+
+    When the transaction already has an acquisition date, prefer lapse events
+    whose lapse_date matches that date.
 
     Returns the best match, or None.
     """
     best: LapseEvent | None = None
+    best_diff = float("inf")
+
+    if tx.quantity == 0:
+        return None
+
+    per_share_cost = tx.cost_basis_usd / tx.quantity
 
     for event in candidates:
-        key = (event.symbol, event.lapse_date, event.award_id or "")
+        if not _per_share_matches(tx.cost_basis_usd, tx.quantity, event.fmv_per_share_usd):
+            continue
 
-        # Match by acquisition date if available
+        diff = abs(per_share_cost - event.fmv_per_share_usd)
+
+        # Prefer date-matching events when tx has an acquisition date
         if tx.has_acquisition_date and tx.date_acquired == event.lapse_date:
-            if _cost_basis_matches(tx.cost_basis_usd, event.fmv_per_share_usd, tx.quantity):
-                if key not in used:
-                    best = event
-                    break
+            return event  # exact date + per-share match — best possible
 
-        # Match by cost basis when acquisition date is missing
-        if not tx.has_acquisition_date:
-            if _cost_basis_matches(tx.cost_basis_usd, event.fmv_per_share_usd, tx.quantity):
-                if key not in used:
-                    best = event
-                    break
+        if diff < best_diff:
+            best_diff = diff
+            best = event
 
     return best
 
@@ -90,7 +99,7 @@ def enrich_transactions(
     """Enrich transactions with lapse event data.
 
     For each transaction:
-    - Try to match it to a lapse event by symbol + cost basis
+    - Try to match it to a lapse event by symbol + per-share cost basis
     - If matched and acquisition date was missing, fill it in from lapse_date
     - Track match statistics for verification
 
@@ -108,8 +117,6 @@ def enrich_transactions(
     matched = 0
     unmatched_missing_date = 0
 
-    # Track which lapse events have been used (for one-to-many matching,
-    # a single lapse event can match multiple sell lots)
     enriched: list[SchwabTransaction] = []
 
     for tx in transactions:
@@ -120,15 +127,11 @@ def enrich_transactions(
             enriched.append(tx)
             continue
 
-        # For lapse matching, we don't mark events as "used" because
-        # one lapse event produces multiple sell lots (sell-to-cover +
-        # potentially later voluntary sales from delivered shares).
-        match = _find_matching_lapse(tx, candidates, set())
+        match = _find_matching_lapse(tx, candidates)
 
         if match is not None:
             matched += 1
             if not tx.has_acquisition_date:
-                # Fill in the acquisition date from the lapse event
                 tx = tx.model_copy(update={
                     "date_acquired": match.lapse_date,
                     "has_acquisition_date": True,
@@ -142,7 +145,7 @@ def enrich_transactions(
     if unmatched_missing_date > 0:
         warnings.append(
             f"{unmatched_missing_date} transaction(s) still missing acquisition date "
-            f"after lapse matching"
+            f"after lapse matching (lapse file may not cover all vest dates)"
         )
 
     if matched > 0:

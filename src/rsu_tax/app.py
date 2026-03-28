@@ -122,6 +122,12 @@ async def upload(
             enrichment = enrich_transactions(transactions, lapse_result.events)
             transactions = enrichment.transactions
             all_warnings.extend(enrichment.warnings)
+            # Replace the CSV parser's "no date" warning when enrichment handled it
+            if enrichment.matched > 0:
+                all_warnings = [
+                    w for w in all_warnings
+                    if "No \"Date Acquired\" column found" not in w
+                ]
 
     # Parse 1042-S if provided
     tax_form_data: TaxFormData | None = None

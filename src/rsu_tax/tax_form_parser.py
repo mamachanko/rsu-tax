@@ -2,6 +2,11 @@
 
 Extracts key fields: gross income, tax withheld, withholding rate,
 income code, and recipient country from IRS Form 1042-S.
+
+The Schwab 1042-S PDF has a specific layout: form labels occupy the top portion
+of each page, and field VALUES appear in a positional blob at the bottom after
+the "Form 1042-S (YYYY)" marker.  This parser targets that value blob rather
+than trying to match labels to adjacent values.
 """
 
 from __future__ import annotations
@@ -12,55 +17,145 @@ from dataclasses import dataclass, field
 from .models import TaxFormData
 
 
-def _extract_dollar_amount(text: str) -> float | None:
-    """Extract a dollar amount from text like '$1,234.56' or '1234.56'."""
-    m = re.search(r"\$?([\d,]+\.\d{2})", text)
-    if m:
-        return float(m.group(1).replace(",", ""))
-    return None
-
-
-def _extract_percentage(text: str) -> float | None:
-    """Extract a percentage like '30.00' or '15' from text."""
-    m = re.search(r"(\d{1,3}(?:\.\d{1,2})?)\s*%?", text)
-    if m:
-        val = float(m.group(1))
-        if 0 < val <= 100:
-            return val / 100.0
-    return None
-
-
 @dataclass
 class TaxFormParseResult:
     data: TaxFormData | None
     warnings: list[str] = field(default_factory=list)
 
 
-def _find_box_value(text: str, box_pattern: str) -> str:
-    """Find the value associated with a box label in extracted PDF text."""
-    m = re.search(box_pattern, text, re.IGNORECASE)
+def _extract_value_blob(page_text: str) -> str | None:
+    """Extract the value blob that follows 'Form 1042-S (YYYY)' on a page."""
+    m = re.search(r"Form\s+1042-S\s*\(\d{4}\)\s*\n(.*)", page_text, re.DOTALL)
     if m:
-        # Return the rest of the line or next few characters after the match
-        start = m.end()
-        end = min(start + 50, len(text))
-        remaining = text[start:end].strip()
-        # Take until newline
-        return remaining.split("\n")[0].strip()
-    return ""
+        return m.group(1).strip()
+    return None
+
+
+def _find_form_pages(reader: "PdfReader") -> list[tuple[int, str, str]]:
+    """Find form pages (not instruction pages) and extract their text + value blobs.
+
+    Returns list of (page_index, full_text, value_blob).
+    """
+    pages = []
+    for i, page in enumerate(reader.pages):
+        text = page.extract_text() or ""
+        if len(text) > 8000:
+            continue  # skip instruction pages
+        if "1042-S" not in text:
+            continue
+        blob = _extract_value_blob(text)
+        if blob:
+            pages.append((i, text, blob))
+    return pages
+
+
+def _parse_value_blob(blob: str) -> dict[str, float | str | None]:
+    """Parse the positional value blob from a 1042-S form page.
+
+    The blob has a consistent structure (values in form-field order):
+    - Line 1: gross_income [spaces] other_amounts
+    - Then: EIN, status codes, agent name
+    - Then: country code, GIIN parts
+    - Then: recipient name + country
+    - Then: tax_withheld (Box 7a)
+    - Then: total_withholding_credit (Box 10)
+    - Then: TIN, account number
+    - Then: income_code + rate + other amounts
+    - Then: addresses, DOB, etc.
+    """
+    result: dict[str, float | str | None] = {
+        "gross_income": None,
+        "tax_withheld": None,
+        "withholding_rate": None,
+        "income_code": None,
+        "recipient_country": None,
+    }
+
+    lines = blob.split("\n")
+    if not lines:
+        return result
+
+    # ── Gross income: first large dollar amount on line 1 ───────────────
+    first_line = lines[0].strip()
+    amounts_on_first_line = re.findall(r"(\d[\d,]*\.\d{2})", first_line)
+    for amt_str in amounts_on_first_line:
+        val = float(amt_str.replace(",", ""))
+        if val > 10:  # skip zeros and small codes
+            result["gross_income"] = val
+            break
+
+    # ── Find tax withheld and rate from the blob ────────────────────────
+    # Strategy: find all dollar amounts in the blob, then use position to
+    # identify which is which.  Tax withheld comes AFTER the EIN/name block
+    # and is typically a smaller amount than gross income.
+    all_amounts: list[tuple[int, float]] = []  # (line_index, value)
+    ein_line: int | None = None
+    for i, line in enumerate(lines):
+        # Track where EIN appears (marks the boundary)
+        if re.search(r"\d{2}-\d{7,}", line):
+            ein_line = i
+        for m in re.finditer(r"(\d[\d,]*\.\d{2})", line):
+            val = float(m.group(1).replace(",", ""))
+            all_amounts.append((i, val))
+
+    # Tax withheld: first non-zero amount appearing after the EIN line,
+    # that isn't on line 0 (gross income) and is on its own line
+    if ein_line is not None:
+        for line_idx, val in all_amounts:
+            if line_idx <= (ein_line if ein_line else 0):
+                continue
+            line_text = lines[line_idx].strip()
+            # Tax withheld is usually on its own line or nearly so
+            if re.match(r"^\d[\d,]*\.\d{2}$", line_text):
+                result["tax_withheld"] = val
+                break
+
+    # ── Withholding rate: look for "NN 15" or "NN 30" or "NN15" pattern ──
+    # The income code and rate often appear as "CC RR" or "CCRR..." on the
+    # same line, e.g., "00 1514.63..." = code 00, rate 15%.
+    for line in lines:
+        # Explicit space-separated: "02 15" at start of line
+        m = re.match(r"^(\d{2})\s+(15|30|14)\b", line.strip())
+        if m:
+            result["income_code"] = m.group(1)
+            result["withholding_rate"] = int(m.group(2)) / 100.0
+            break
+        # Concatenated: "00 1514.63..." — code, then rate glued to next value
+        m = re.match(r"^(\d{2})\s+(15|30|14)\d", line.strip())
+        if m:
+            result["income_code"] = m.group(1)
+            result["withholding_rate"] = int(m.group(2)) / 100.0
+            break
+
+    # ── Recipient country: last 2 uppercase chars on a name-only line ───
+    for line in lines:
+        line_s = line.strip()
+        # Skip lines with digits (EINs, amounts, TINs, etc.)
+        if re.search(r"\d", line_s):
+            continue
+        # Skip short lines and "US" line
+        if len(line_s) <= 3:
+            continue
+        # Pattern: uppercase letters ending with a 2-char country code
+        # e.g., "MARIA GARCIAGM" → "GM", "JOHN DOEDE" → "DE"
+        if line_s[-2:].isupper() and line_s[-3:-2].isalpha():
+            code = line_s[-2:]
+            if code not in ("US", "NO", "OK", "AN", "ON", "IN", "ER", "ED",
+                            "AL", "LE", "RE", "ST", "AY", "EY", "ES", "SS"):
+                result["recipient_country"] = code
+                break
+
+    return result
 
 
 def parse_1042s_pdf(pdf_path: str) -> TaxFormParseResult:
     """Parse a 1042-S PDF and extract key tax fields.
 
-    Looks for:
-    - Box 2: Gross income
-    - Box 7a: Federal tax withheld
-    - Box 3b: Tax rate
-    - Box 1: Income code
-    - Box 13e/13f: Recipient country
-    - Tax year from the form header
+    Processes all form pages, preferring Copy B (recipient's copy).
+    If multiple copies have different values (as can happen with anonymized PDFs),
+    uses the copy with the largest gross income.
 
-    Returns TaxFormParseResult with parsed data or warnings if parsing failed.
+    Returns TaxFormParseResult with parsed data or warnings.
     """
     from pypdf import PdfReader
 
@@ -77,8 +172,7 @@ def parse_1042s_pdf(pdf_path: str) -> TaxFormParseResult:
     # Extract text from all pages
     full_text = ""
     for page in reader.pages:
-        page_text = page.extract_text() or ""
-        full_text += page_text + "\n"
+        full_text += (page.extract_text() or "") + "\n"
 
     if not full_text.strip():
         return TaxFormParseResult(
@@ -86,7 +180,6 @@ def parse_1042s_pdf(pdf_path: str) -> TaxFormParseResult:
             warnings=["Could not extract text from PDF"],
         )
 
-    # Check this is actually a 1042-S
     if "1042-S" not in full_text and "1042" not in full_text:
         return TaxFormParseResult(
             data=None,
@@ -94,158 +187,78 @@ def parse_1042s_pdf(pdf_path: str) -> TaxFormParseResult:
         )
 
     # ── Tax year ────────────────────────────────────────────────────────
-    tax_year: int | None = None
-    # Look for year patterns near "1042-S" or "tax year"
-    year_m = re.search(r"(?:tax\s+year|for\s+calendar\s+year)\s*[:\s]*(\d{4})", full_text, re.IGNORECASE)
+    tax_year = 0
+    year_m = re.search(r"Form\s+1042-S\s*\((\d{4})\)", full_text)
     if year_m:
         tax_year = int(year_m.group(1))
     else:
-        # Try finding a 4-digit year near "1042"
-        year_m = re.search(r"1042-S\s*(\d{4})", full_text)
+        year_m = re.search(r"\b(202\d)\b", full_text)
         if year_m:
             tax_year = int(year_m.group(1))
-        else:
-            # Last resort: any 4-digit year in 2020-2030 range
-            year_m = re.search(r"\b(202\d)\b", full_text)
-            if year_m:
-                tax_year = int(year_m.group(1))
 
-    if tax_year is None:
+    if tax_year == 0:
         warnings.append("Could not determine tax year from 1042-S")
-        tax_year = 0
 
-    # ── Process only Copy B (recipient's copy) ──────────────────────────
-    # The 1042-S PDF often has multiple copies. We want Copy B.
-    # Split by pages and look for Copy B section
-    copy_b_text = full_text  # fallback to full text
-    for page in reader.pages:
-        page_text = page.extract_text() or ""
-        if "Copy B" in page_text and len(page_text) < 8000:
-            copy_b_text = page_text
-            break
+    # ── Find and parse form pages ───────────────────────────────────────
+    form_pages = _find_form_pages(reader)
+    if not form_pages:
+        return TaxFormParseResult(
+            data=None,
+            warnings=["No form pages found in 1042-S PDF"],
+        )
 
-    # ── Box 2: Gross income ─────────────────────────────────────────────
-    gross_income: float | None = None
-    # Pattern: "2 Gross income" followed by amount
-    box2_patterns = [
-        r"(?:box\s*)?2[.\s]+[Gg]ross\s+[Ii]ncome[:\s]*\$?([\d,]+\.?\d*)",
-        r"[Gg]ross\s+[Ii]ncome[:\s]*\$?([\d,]+\.\d{2})",
-        r"2\s+\$?([\d,]+\.\d{2})",
-    ]
-    for pat in box2_patterns:
-        m = re.search(pat, copy_b_text)
-        if m:
-            try:
-                gross_income = float(m.group(1).replace(",", ""))
-                break
-            except ValueError:
-                continue
+    # Prefer Copy B page; fall back to first form page
+    best_blob: dict[str, float | str | None] | None = None
+    best_gross: float = 0
 
-    if gross_income is None:
-        # Try to find any large dollar amount in the text (likely gross income)
-        amounts = re.findall(r"\$?([\d,]+\.\d{2})", copy_b_text)
-        if amounts:
-            parsed_amounts = []
-            for a in amounts:
-                try:
-                    parsed_amounts.append(float(a.replace(",", "")))
-                except ValueError:
-                    continue
-            if parsed_amounts:
-                # The largest amount is likely gross income
-                gross_income = max(parsed_amounts)
-                warnings.append(
-                    f"Gross income ({gross_income:.2f}) was inferred from largest "
-                    f"amount — please verify"
-                )
+    for page_idx, page_text, blob_text in form_pages:
+        parsed = _parse_value_blob(blob_text)
+        gross = parsed.get("gross_income")
+        if gross is not None and isinstance(gross, (int, float)):
+            is_copy_b = "Copy B" in page_text
+            # Prefer Copy B; otherwise take the largest gross income
+            if is_copy_b or gross > best_gross:
+                best_blob = parsed
+                best_gross = gross
+                if is_copy_b:
+                    break
 
-    # ── Box 7a: Federal tax withheld ────────────────────────────────────
-    tax_withheld: float | None = None
-    box7_patterns = [
-        r"(?:box\s*)?7a?[.\s]+(?:[Ff]ederal\s+)?[Tt]ax\s+[Ww]ithheld[:\s]*\$?([\d,]+\.?\d*)",
-        r"[Ff]ederal\s+[Tt]ax\s+[Ww]ithheld[:\s]*\$?([\d,]+\.\d{2})",
-        r"7a?\s+\$?([\d,]+\.\d{2})",
-    ]
-    for pat in box7_patterns:
-        m = re.search(pat, copy_b_text)
-        if m:
-            try:
-                tax_withheld = float(m.group(1).replace(",", ""))
-                break
-            except ValueError:
-                continue
+    if best_blob is None or best_blob.get("gross_income") is None:
+        return TaxFormParseResult(
+            data=None,
+            warnings=["Could not extract gross income from 1042-S"],
+        )
 
-    # ── Box 3b: Tax rate ────────────────────────────────────────────────
-    withholding_rate: float | None = None
-    rate_patterns = [
-        r"(?:box\s*)?3b?[.\s]+(?:[Rr]ate|[Tt]ax\s+[Rr]ate)[:\s]*(\d{1,3}(?:\.\d{1,2})?)\s*%?",
-        r"(?:[Rr]ate\s+of\s+)?[Ww]ithholding[:\s]*(\d{1,3}(?:\.\d{1,2})?)\s*%",
-        r"(\d{2}(?:\.\d{2})?)\s*%",
-    ]
-    for pat in rate_patterns:
-        m = re.search(pat, copy_b_text)
-        if m:
-            val = float(m.group(1))
-            if 0 < val <= 100:
-                withholding_rate = val / 100.0
-                break
+    gross_income = float(best_blob["gross_income"])  # type: ignore[arg-type]
+    tax_withheld = float(best_blob.get("tax_withheld") or 0)
+    withholding_rate = best_blob.get("withholding_rate")
+    income_code = best_blob.get("income_code")
+    recipient_country = best_blob.get("recipient_country")
 
-    # ── Box 1: Income code ──────────────────────────────────────────────
-    income_code: str | None = None
-    code_m = re.search(r"(?:box\s*)?1[.\s]+[Ii]ncome\s+[Cc]ode[:\s]*(\d{1,2})", copy_b_text)
-    if code_m:
-        income_code = code_m.group(1)
-    else:
-        # Income code 19 = "Compensation during studying and training"
-        # Income code 20 = "Compensation for independent personal services"
-        # Income code 15 = "Pensions and annuities"
-        # Income code 50 = "Other income"
-        code_m = re.search(r"\b(1[0-9]|[2-5][0-9])\b", copy_b_text[:200])
-        if code_m:
-            income_code = code_m.group(1)
-
-    # ── Recipient country ───────────────────────────────────────────────
-    recipient_country: str | None = None
-    country_m = re.search(
-        r"(?:13[ef]|[Cc]ountry)[:\s]*(GERMANY|DE|DEUTSCHLAND|[A-Z]{2})",
-        copy_b_text, re.IGNORECASE,
-    )
-    if country_m:
-        recipient_country = country_m.group(1).upper()
-
-    # ── Validate and build result ───────────────────────────────────────
-    if gross_income is None:
-        warnings.append("Could not find gross income (Box 2)")
-    if tax_withheld is None:
-        warnings.append("Could not find federal tax withheld (Box 7)")
-        tax_withheld = 0.0
-
-    # Cross-check: tax_withheld / gross_income should ≈ withholding_rate
-    if gross_income and tax_withheld and withholding_rate:
+    # Cross-check: infer rate if not found
+    if withholding_rate is None and gross_income > 0 and tax_withheld > 0:
+        inferred = tax_withheld / gross_income
+        if 0.05 <= inferred <= 0.50:  # only accept reasonable rates
+            withholding_rate = round(inferred, 4)
+            warnings.append(
+                f"Withholding rate inferred as {withholding_rate:.1%} from amounts"
+            )
+    elif withholding_rate is not None and gross_income > 0 and tax_withheld > 0:
         expected = gross_income * withholding_rate
-        if abs(expected - tax_withheld) > max(1.0, gross_income * 0.01):
+        if abs(expected - tax_withheld) > max(1.0, gross_income * 0.02):
             warnings.append(
                 f"Tax withheld ({tax_withheld:.2f}) doesn't match "
                 f"gross income ({gross_income:.2f}) x rate ({withholding_rate:.0%}) "
                 f"= {expected:.2f}"
             )
-    elif gross_income and tax_withheld and withholding_rate is None:
-        # Infer rate from amounts
-        withholding_rate = tax_withheld / gross_income
-        warnings.append(
-            f"Withholding rate inferred as {withholding_rate:.1%} from amounts"
-        )
-
-    if gross_income is None:
-        return TaxFormParseResult(data=None, warnings=warnings)
 
     data = TaxFormData(
         tax_year=tax_year,
         gross_income_usd=gross_income,
-        tax_withheld_usd=tax_withheld or 0.0,
-        withholding_rate=withholding_rate or 0.0,
-        income_code=income_code,
-        recipient_country=recipient_country,
+        tax_withheld_usd=tax_withheld,
+        withholding_rate=float(withholding_rate or 0),
+        income_code=str(income_code) if income_code else None,
+        recipient_country=str(recipient_country) if recipient_country else None,
     )
 
     return TaxFormParseResult(data=data, warnings=warnings)
